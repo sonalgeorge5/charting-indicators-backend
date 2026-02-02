@@ -306,6 +306,48 @@ async def save_script(request: SaveRequest):
         raise HTTPException(500, str(e))
 
 
+class ValidateRequest(BaseModel):
+    code: str
+
+
+@app.post("/validate")
+async def validate_script(request: ValidateRequest):
+    """Validate Python code syntax"""
+    try:
+        # Try to compile the code to check for syntax errors
+        compile(request.code, '<string>', 'exec')
+        
+        # Check if code has required structure
+        temp_globals = {}
+        exec(request.code, temp_globals)
+        
+        has_indicator = 'indicator' in temp_globals
+        has_calculate = 'calculate' in temp_globals and callable(temp_globals.get('calculate'))
+        
+        if not has_calculate:
+            return {
+                "valid": False, 
+                "error": "Script must have a 'calculate(data, inputs)' function"
+            }
+        
+        return {
+            "valid": True,
+            "has_metadata": has_indicator,
+            "message": "Code is valid"
+        }
+    except SyntaxError as e:
+        return {
+            "valid": False,
+            "error": f"Syntax error at line {e.lineno}: {e.msg}"
+        }
+    except Exception as e:
+        return {
+            "valid": False,
+            "error": str(e)
+        }
+
+
+
 @app.get("/templates")
 async def get_templates():
     return {
