@@ -21,18 +21,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS for frontend access
+# CORS for frontend access - allow all origins for public API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", 
-        "http://localhost:3000", 
-        "https://charting-platform.onrender.com",
-        "*"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using wildcard origins
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # User scripts directory
