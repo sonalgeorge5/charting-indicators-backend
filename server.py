@@ -31,6 +31,24 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+# Custom exception handler to ensure CORS headers on error responses
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Ensure CORS headers are included in error responses"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+
 # User scripts directory
 SCRIPTS_DIR = Path.home() / "CryptoChartPro" / "scripts"
 SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
