@@ -14,6 +14,7 @@ import os
 import importlib.util
 import traceback
 from pathlib import Path
+from alert_worker import AlertConfig, EmaRetestAlertWorker
 
 app = FastAPI(
     title="CryptoChart Pro Indicator Server",
@@ -55,6 +56,8 @@ SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Built-in indicators directory
 BUILTIN_DIR = Path(__file__).parent / "builtin"
+ALERT_CONFIG = AlertConfig.from_env()
+ALERT_WORKER = EmaRetestAlertWorker(ALERT_CONFIG)
 
 
 class OHLCVData(BaseModel):
@@ -225,7 +228,21 @@ def execute_script(module, df: pd.DataFrame, params: Dict[str, Any]) -> Indicato
 
 @app.get("/")
 async def root():
-    return {"status": "running", "service": "CryptoChart Pro Indicator Server"}
+    return {
+        "status": "running",
+        "service": "CryptoChart Pro Indicator Server",
+        "alerts": ALERT_WORKER.status(),
+    }
+
+
+@app.on_event("startup")
+async def startup_event():
+    await ALERT_WORKER.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await ALERT_WORKER.stop()
 
 
 @app.get("/scripts", response_model=List[ScriptInfo])
@@ -415,6 +432,28 @@ def calculate(data, inputs):
 '''
     }
 
+
+@app.get("/alerts/status")
+async def alerts_status():
+    return ALERT_WORKER.status()
+
+
+@app.post("/alerts/scan-now")
+async def alerts_scan_now():
+    sent = await ALERT_WORKER.scan_once_async()
+    return {
+        "ok": True,
+        "sent_count": len(sent),
+        "sent": sent,
+        "status": ALERT_WORKER.status(),
+    }
+
+
+@app.post("/alerts/test-telegram")
+async def alerts_test_telegram():
+    ok = await ALERT_WORKER.send_test_async()
+    return {"ok": ok, "status": ALERT_WORKER.status()}
+
 if __name__ == "__main__":
     import uvicorn
     import os
@@ -426,4 +465,3 @@ if __name__ == "__main__":
     print(f"Starting server on port {port}")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
-

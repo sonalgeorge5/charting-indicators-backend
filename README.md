@@ -20,6 +20,30 @@ python server.py
 
 Server runs on: `http://localhost:8765`
 
+### 2.5 Optional: Enable Telegram EMA 55/100/200 Alerts
+Set these environment variables before starting `server.py`:
+
+```bash
+export ALERTS_ENABLED=true
+export TELEGRAM_BOT_TOKEN=your_bot_token
+export TELEGRAM_CHAT_ID=your_chat_id
+export ALERT_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT
+export ALERT_TIMEFRAME=30m
+export ALERT_HTF_TIMEFRAME=4h
+export ALERT_DIRECTION=both
+```
+
+Optional tuning:
+
+```bash
+export ALERT_SCAN_SECONDS=60
+export ALERT_COOLDOWN_SECONDS=21600
+export ALERT_RETEST_TOLERANCE_PCT=0.001
+export ALERT_MIN_ADX_LONG=30
+export ALERT_MIN_ADX_SHORT=25
+export ALERT_MIN_EMA_SPREAD_PCT=0.01
+```
+
 ### 3. Test API
 Visit: `http://localhost:8765/docs` for interactive API documentation
 
@@ -71,6 +95,17 @@ Health check
   "service": "CryptoChart Pro Indicator Server"
 }
 ```
+
+---
+
+### `GET /alerts/status`
+Returns scanner/telegram worker status and runtime config.
+
+### `POST /alerts/scan-now`
+Runs one immediate scan cycle across configured symbols.
+
+### `POST /alerts/test-telegram`
+Sends a test Telegram message using configured bot/chat credentials.
 
 ---
 
