@@ -8,15 +8,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 
 BINANCE_SPOT_API = "https://api.binance.com/api/v3"
+BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
+BYBIT_API = "https://api.bybit.com/v5/market"
 
 
 def _as_bool(value: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _interval_to_ms(interval: str) -> int:
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60_000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3_600_000
+    if interval.endswith("d"):
+        return int(interval[:-1]) * 86_400_000
+    if interval.endswith("w"):
+        return int(interval[:-1]) * 604_800_000
+    return 60_000
 
 
 def _ema_series(values: List[float], period: int) -> List[float]:
@@ -174,25 +189,95 @@ class EmaRetestAlertWorker:
         with urlopen(req, timeout=12) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _fetch_klines(self, symbol: str, interval: str, limit: int) -> List[List[Any]]:
-        q = urlencode({"symbol": symbol, "interval": interval, "limit": limit})
-        url = f"{BINANCE_SPOT_API}/klines?{q}"
-        rows = self._request_json(url)
-        return rows if isinstance(rows, list) else []
+    def _normalize_bybit_rows(self, rows: List[List[Any]]) -> List[List[Any]]:
+        # Bybit row format:
+        # [startTime, open, high, low, close, volume, turnover]
+        norm: List[List[Any]] = []
+        for r in rows:
+            try:
+                t = int(r[0])
+                o = str(r[1])
+                h = str(r[2])
+                l = str(r[3])
+                c = str(r[4])
+                v = str(r[5])
+                close_time = t + 1
+                norm.append([t, o, h, l, c, v, close_time])
+            except Exception:
+                continue
+        norm.sort(key=lambda x: int(x[0]))
+        return norm
 
-    def _closed_index(self, rows: List[List[Any]]) -> int:
+    def _to_bybit_interval(self, interval: str) -> Optional[str]:
+        map_tf = {
+            "1m": "1",
+            "3m": "3",
+            "5m": "5",
+            "15m": "15",
+            "30m": "30",
+            "1h": "60",
+            "2h": "120",
+            "4h": "240",
+            "1d": "D",
+            "1w": "W",
+        }
+        return map_tf.get(interval)
+
+    def _fetch_klines(self, symbol: str, interval: str, limit: int) -> List[List[Any]]:
+        # 1) Binance spot
+        try:
+            q = urlencode({"symbol": symbol, "interval": interval, "limit": limit})
+            url = f"{BINANCE_SPOT_API}/klines?{q}"
+            rows = self._request_json(url)
+            if isinstance(rows, list) and rows:
+                return rows
+        except HTTPError:
+            pass
+        except Exception:
+            pass
+
+        # 2) Binance futures
+        try:
+            q = urlencode({"symbol": symbol, "interval": interval, "limit": limit})
+            url = f"{BINANCE_FUTURES_API}/klines?{q}"
+            rows = self._request_json(url)
+            if isinstance(rows, list) and rows:
+                return rows
+        except HTTPError:
+            pass
+        except Exception:
+            pass
+
+        # 3) Bybit linear
+        try:
+            bybit_interval = self._to_bybit_interval(interval)
+            if bybit_interval:
+                q = urlencode({"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit})
+                url = f"{BYBIT_API}/kline?{q}"
+                body = self._request_json(url)
+                rows = body.get("result", {}).get("list", []) if isinstance(body, dict) else []
+                if isinstance(rows, list) and rows:
+                    return self._normalize_bybit_rows(rows)
+        except Exception:
+            pass
+
+        return []
+
+    def _closed_index(self, rows: List[List[Any]], interval: str) -> int:
         if not rows:
             return -1
         now_ms = int(time.time() * 1000)
+        interval_ms = _interval_to_ms(interval)
         idx = len(rows) - 1
-        close_ms = int(rows[idx][6])
+        open_ms = int(rows[idx][0])
+        close_ms = open_ms + interval_ms - 1
         if close_ms > now_ms:
             idx -= 1
         return idx
 
     def _htf_bias(self, symbol: str) -> int:
         rows = self._fetch_klines(symbol, self.cfg.htf_timeframe, 260)
-        idx = self._closed_index(rows)
+        idx = self._closed_index(rows, self.cfg.htf_timeframe)
         if idx < 220:
             return 0
         closes = [float(r[4]) for r in rows[:idx + 1]]
@@ -208,7 +293,7 @@ class EmaRetestAlertWorker:
 
     def _signal_for_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         rows = self._fetch_klines(symbol, self.cfg.timeframe, 420)
-        idx = self._closed_index(rows)
+        idx = self._closed_index(rows, self.cfg.timeframe)
         if idx < 220:
             return None
 
