@@ -321,11 +321,26 @@ class EmaRetestAlertWorker:
         except Exception:
             pass
 
-        if not out:
-            raise RuntimeError("could not fetch Binance symbol universe")
-
         self._binance_spot_cache = {"symbols": out, "updated_at": now}
         return out
+
+    def _is_binance_pair_supported(self, pair: str, interval: str) -> bool:
+        # Probe Binance spot then futures directly when exchangeInfo is blocked.
+        try:
+            q = urlencode({"symbol": pair, "interval": interval, "limit": 1})
+            rows = self._request_json(f"{BINANCE_SPOT_API}/klines?{q}")
+            if isinstance(rows, list) and rows:
+                return True
+        except Exception:
+            pass
+        try:
+            q = urlencode({"symbol": pair, "interval": interval, "limit": 1})
+            rows = self._request_json(f"{BINANCE_FUTURES_API}/klines?{q}")
+            if isinstance(rows, list) and rows:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _looks_like_stablecoin(self, symbol: str, name: str) -> bool:
         sym = symbol.strip().lower()
@@ -347,8 +362,7 @@ class EmaRetestAlertWorker:
 
     def _fetch_top_marketcap_binance_symbols(self) -> List[str]:
         listed = self._fetch_binance_listed_symbols()
-        if not listed:
-            return []
+        use_pair_probe = len(listed) == 0
 
         selected: List[str] = []
         seen_base = set()
@@ -374,8 +388,12 @@ class EmaRetestAlertWorker:
                 if self.cfg.exclude_stablecoins and self._looks_like_stablecoin(base, name):
                     continue
                 pair = f"{base}{self.cfg.quote_asset}"
-                if pair not in listed:
-                    continue
+                if not use_pair_probe:
+                    if pair not in listed:
+                        continue
+                else:
+                    if not self._is_binance_pair_supported(pair, self.cfg.timeframe):
+                        continue
                 selected.append(pair)
                 seen_base.add(base)
                 if len(selected) >= self.cfg.top_n:
