@@ -176,6 +176,7 @@ class EmaRetestAlertWorker:
         self._last_scan_at: Optional[int] = None
         self._effective_symbols: List[str] = list(cfg.symbols)
         self._last_universe_refresh: Optional[int] = None
+        self._last_universe_source: Optional[str] = None
         self._binance_spot_cache: Dict[str, Any] = {"symbols": set(), "updated_at": 0}
         self._state = self._load_state()
 
@@ -366,21 +367,8 @@ class EmaRetestAlertWorker:
 
         selected: List[str] = []
         seen_base = set()
-        per_page = 250
-        # Pull extra pages so we can still fill top N after stablecoin + listing filters.
-        for page in range(1, 5):
-            q = urlencode({
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": per_page,
-                "page": page,
-                "sparkline": "false",
-            })
-            url = f"https://api.coingecko.com/api/v3/coins/markets?{q}"
-            rows = self._request_json(url, extra_headers={"accept": "application/json", "user-agent": "charting-alert-worker/1.0"})
-            if not isinstance(rows, list) or not rows:
-                break
-            for coin in rows:
+        def build_from_candidates(candidates: List[Dict[str, str]]) -> List[str]:
+            for coin in candidates:
                 base = str(coin.get("symbol", "")).upper()
                 name = str(coin.get("name", ""))
                 if not base or base in seen_base:
@@ -397,7 +385,73 @@ class EmaRetestAlertWorker:
                 selected.append(pair)
                 seen_base.add(base)
                 if len(selected) >= self.cfg.top_n:
-                    return selected
+                    break
+            return selected
+
+        def fetch_coingecko() -> List[Dict[str, str]]:
+            coins: List[Dict[str, str]] = []
+            per_page = 250
+            for page in range(1, 5):
+                q = urlencode({
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": per_page,
+                    "page": page,
+                    "sparkline": "false",
+                })
+                url = f"https://api.coingecko.com/api/v3/coins/markets?{q}"
+                rows = self._request_json(url, extra_headers={"accept": "application/json", "user-agent": "charting-alert-worker/1.0"})
+                if not isinstance(rows, list) or not rows:
+                    break
+                for r in rows:
+                    coins.append({"symbol": str(r.get("symbol", "")), "name": str(r.get("name", ""))})
+                if len(coins) >= self.cfg.top_n * 3:
+                    break
+            return coins
+
+        def fetch_coinpaprika() -> List[Dict[str, str]]:
+            rows = self._request_json("https://api.coinpaprika.com/v1/tickers?quotes=USD")
+            if not isinstance(rows, list):
+                return []
+            rows.sort(key=lambda x: int(x.get("rank", 10_000_000)))
+            out = []
+            for r in rows[: self.cfg.top_n * 4]:
+                out.append({"symbol": str(r.get("symbol", "")), "name": str(r.get("name", ""))})
+            return out
+
+        def fetch_coinlore() -> List[Dict[str, str]]:
+            q = urlencode({"start": 0, "limit": 400})
+            body = self._request_json(f"https://api.coinlore.net/api/tickers/?{q}")
+            rows = body.get("data", []) if isinstance(body, dict) else []
+            if not isinstance(rows, list):
+                return []
+            out = []
+            for r in rows:
+                out.append({"symbol": str(r.get("symbol", "")), "name": str(r.get("name", ""))})
+            return out
+
+        sources = [
+            ("coingecko", fetch_coingecko),
+            ("coinpaprika", fetch_coinpaprika),
+            ("coinlore", fetch_coinlore),
+        ]
+
+        last_err: Optional[str] = None
+        for source_name, fn in sources:
+            try:
+                candidates = fn()
+                if not candidates:
+                    continue
+                out = build_from_candidates(candidates)
+                if out:
+                    self._last_universe_source = source_name
+                    return out
+            except Exception as exc:
+                last_err = f"{source_name}: {exc}"
+                continue
+
+        if last_err:
+            raise RuntimeError(last_err)
         return selected
 
     def _refresh_symbol_universe(self, force: bool = False) -> None:
@@ -660,6 +714,7 @@ class EmaRetestAlertWorker:
             "exclude_stablecoins": self.cfg.exclude_stablecoins,
             "universe_refresh_seconds": self.cfg.universe_refresh_seconds,
             "last_universe_refresh": self._last_universe_refresh,
+            "last_universe_source": self._last_universe_source,
             "timeframe": self.cfg.timeframe,
             "htf_timeframe": self.cfg.htf_timeframe,
             "direction": self.cfg.direction,
