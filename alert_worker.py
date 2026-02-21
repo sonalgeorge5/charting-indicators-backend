@@ -116,6 +116,11 @@ class AlertConfig:
     htf_timeframe: str
     direction: str
     scan_seconds: int
+    universe_mode: str
+    top_n: int
+    universe_refresh_seconds: int
+    quote_asset: str
+    exclude_stablecoins: bool
     cooldown_seconds: int
     retest_tolerance_pct: float
     min_ema_spread_pct: float
@@ -130,6 +135,10 @@ class AlertConfig:
         symbols = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
         state_dir = Path.home() / "CryptoChartPro"
         state_dir.mkdir(parents=True, exist_ok=True)
+        universe_mode = os.getenv("ALERT_UNIVERSE_MODE", "top_marketcap_binance").strip().lower()
+        scan_seconds = max(20, int(os.getenv("ALERT_SCAN_SECONDS", "60")))
+        if universe_mode == "top_marketcap_binance" and scan_seconds < 180:
+            scan_seconds = 180
         return AlertConfig(
             enabled=_as_bool(os.getenv("ALERTS_ENABLED", "false"), False),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -139,7 +148,12 @@ class AlertConfig:
             timeframe=os.getenv("ALERT_TIMEFRAME", "30m").strip(),
             htf_timeframe=os.getenv("ALERT_HTF_TIMEFRAME", "4h").strip(),
             direction=os.getenv("ALERT_DIRECTION", "both").strip().lower(),
-            scan_seconds=max(20, int(os.getenv("ALERT_SCAN_SECONDS", "60"))),
+            scan_seconds=scan_seconds,
+            universe_mode=universe_mode,
+            top_n=max(1, int(os.getenv("ALERT_TOP_N", "100"))),
+            universe_refresh_seconds=max(300, int(os.getenv("ALERT_UNIVERSE_REFRESH_SECONDS", "21600"))),
+            quote_asset=os.getenv("ALERT_QUOTE_ASSET", "USDT").strip().upper(),
+            exclude_stablecoins=_as_bool(os.getenv("ALERT_EXCLUDE_STABLECOINS", "true"), True),
             cooldown_seconds=max(60, int(os.getenv("ALERT_COOLDOWN_SECONDS", "21600"))),
             retest_tolerance_pct=float(os.getenv("ALERT_RETEST_TOLERANCE_PCT", "0.001")),
             min_ema_spread_pct=float(os.getenv("ALERT_MIN_EMA_SPREAD_PCT", "0.01")),
@@ -149,7 +163,8 @@ class AlertConfig:
         )
 
     def is_ready(self) -> bool:
-        return bool(self.telegram_bot_token and self.telegram_chat_id and self.symbols)
+        has_symbols = bool(self.symbols) or self.universe_mode == "top_marketcap_binance"
+        return bool(self.telegram_bot_token and self.telegram_chat_id and has_symbols)
 
 
 class EmaRetestAlertWorker:
@@ -159,6 +174,9 @@ class EmaRetestAlertWorker:
         self._running = False
         self._last_error: Optional[str] = None
         self._last_scan_at: Optional[int] = None
+        self._effective_symbols: List[str] = list(cfg.symbols)
+        self._last_universe_refresh: Optional[int] = None
+        self._binance_spot_cache: Dict[str, Any] = {"symbols": set(), "updated_at": 0}
         self._state = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
@@ -175,10 +193,12 @@ class EmaRetestAlertWorker:
         except Exception:
             pass
 
-    def _request_json(self, url: str) -> Any:
+    def _request_json(self, url: str, extra_headers: Optional[Dict[str, str]] = None) -> Any:
         headers = {}
         if self.cfg.binance_api_key:
             headers["X-MBX-APIKEY"] = self.cfg.binance_api_key
+        if extra_headers:
+            headers.update(extra_headers)
         req = Request(url, headers=headers, method="GET")
         with urlopen(req, timeout=12) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -262,6 +282,103 @@ class EmaRetestAlertWorker:
             pass
 
         return []
+
+    def _fetch_binance_spot_symbols(self) -> set:
+        now = int(time.time())
+        cached = self._binance_spot_cache
+        if cached["symbols"] and now - int(cached["updated_at"]) < 3600:
+            return cached["symbols"]
+        url = f"{BINANCE_SPOT_API}/exchangeInfo"
+        body = self._request_json(url)
+        out = set()
+        for s in body.get("symbols", []):
+            if s.get("status") != "TRADING":
+                continue
+            if s.get("quoteAsset") != self.cfg.quote_asset:
+                continue
+            if not s.get("isSpotTradingAllowed", True):
+                continue
+            sym = str(s.get("symbol", "")).upper()
+            if sym:
+                out.add(sym)
+        self._binance_spot_cache = {"symbols": out, "updated_at": now}
+        return out
+
+    def _looks_like_stablecoin(self, symbol: str, name: str) -> bool:
+        sym = symbol.strip().lower()
+        nm = name.strip().lower()
+        stable_syms = {
+            "usdt", "usdc", "busd", "dai", "tusd", "fdusd", "usde", "usdd",
+            "usdp", "frax", "lusd", "susd", "gusd", "pyusd", "rlusd",
+            "eurt", "eurs", "eurc",
+        }
+        if sym in stable_syms:
+            return True
+        stable_name_keys = [
+            "stablecoin", "usd coin", "tether", "trueusd", "first digital usd",
+            "pax dollar", "paypal usd", "digital usd",
+        ]
+        if any(k in nm for k in stable_name_keys):
+            return True
+        return False
+
+    def _fetch_top_marketcap_binance_symbols(self) -> List[str]:
+        listed = self._fetch_binance_spot_symbols()
+        if not listed:
+            return []
+
+        selected: List[str] = []
+        seen_base = set()
+        per_page = 250
+        # Pull extra pages so we can still fill top N after stablecoin + listing filters.
+        for page in range(1, 5):
+            q = urlencode({
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": page,
+                "sparkline": "false",
+            })
+            url = f"https://api.coingecko.com/api/v3/coins/markets?{q}"
+            rows = self._request_json(url, extra_headers={"accept": "application/json", "user-agent": "charting-alert-worker/1.0"})
+            if not isinstance(rows, list) or not rows:
+                break
+            for coin in rows:
+                base = str(coin.get("symbol", "")).upper()
+                name = str(coin.get("name", ""))
+                if not base or base in seen_base:
+                    continue
+                if self.cfg.exclude_stablecoins and self._looks_like_stablecoin(base, name):
+                    continue
+                pair = f"{base}{self.cfg.quote_asset}"
+                if pair not in listed:
+                    continue
+                selected.append(pair)
+                seen_base.add(base)
+                if len(selected) >= self.cfg.top_n:
+                    return selected
+        return selected
+
+    def _refresh_symbol_universe(self, force: bool = False) -> None:
+        if self.cfg.universe_mode != "top_marketcap_binance":
+            self._effective_symbols = list(self.cfg.symbols)
+            return
+
+        now = int(time.time())
+        if not force and self._last_universe_refresh and (now - self._last_universe_refresh) < self.cfg.universe_refresh_seconds:
+            return
+
+        try:
+            dynamic_symbols = self._fetch_top_marketcap_binance_symbols()
+            if dynamic_symbols:
+                self._effective_symbols = dynamic_symbols
+                self._last_universe_refresh = now
+            elif not self._effective_symbols:
+                self._effective_symbols = list(self.cfg.symbols)
+        except Exception as exc:
+            self._last_error = f"universe: {exc}"
+            if not self._effective_symbols:
+                self._effective_symbols = list(self.cfg.symbols)
 
     def _closed_index(self, rows: List[List[Any]], interval: str) -> int:
         if not rows:
@@ -429,8 +546,11 @@ class EmaRetestAlertWorker:
             return False
 
     def scan_once(self) -> List[Dict[str, Any]]:
+        self._last_error = None
+        self._refresh_symbol_universe()
         sent: List[Dict[str, Any]] = []
-        for symbol in self.cfg.symbols:
+        symbols = self._effective_symbols if self._effective_symbols else self.cfg.symbols
+        for symbol in symbols:
             try:
                 alert = self._signal_for_symbol(symbol)
                 if not alert:
@@ -449,9 +569,11 @@ class EmaRetestAlertWorker:
         return await asyncio.to_thread(self.scan_once)
 
     async def send_test_async(self) -> bool:
+        self._refresh_symbol_universe(force=True)
+        symbols = self._effective_symbols if self._effective_symbols else self.cfg.symbols
         text = (
             "Test message from EMA 55/100/200 alert worker.\n"
-            f"Symbols: {', '.join(self.cfg.symbols)}\n"
+            f"Symbols: {', '.join(symbols[:20])}{' ...' if len(symbols) > 20 else ''}\n"
             f"TF: {self.cfg.timeframe}, HTF: {self.cfg.htf_timeframe}"
         )
         return await asyncio.to_thread(self._send_telegram, text)
@@ -483,11 +605,20 @@ class EmaRetestAlertWorker:
             self._task = None
 
     def status(self) -> Dict[str, Any]:
+        symbols = self._effective_symbols if self._effective_symbols else self.cfg.symbols
         return {
             "enabled": self.cfg.enabled,
             "ready": self.cfg.is_ready(),
             "running": self._running,
-            "symbols": self.cfg.symbols,
+            "symbols": symbols,
+            "symbol_count": len(symbols),
+            "configured_symbols": self.cfg.symbols,
+            "universe_mode": self.cfg.universe_mode,
+            "top_n": self.cfg.top_n,
+            "quote_asset": self.cfg.quote_asset,
+            "exclude_stablecoins": self.cfg.exclude_stablecoins,
+            "universe_refresh_seconds": self.cfg.universe_refresh_seconds,
+            "last_universe_refresh": self._last_universe_refresh,
             "timeframe": self.cfg.timeframe,
             "htf_timeframe": self.cfg.htf_timeframe,
             "direction": self.cfg.direction,

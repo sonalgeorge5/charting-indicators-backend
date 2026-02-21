@@ -27,7 +27,6 @@ Set these environment variables before starting `server.py`:
 export ALERTS_ENABLED=true
 export TELEGRAM_BOT_TOKEN=your_bot_token
 export TELEGRAM_CHAT_ID=your_chat_id
-export ALERT_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT
 export ALERT_TIMEFRAME=30m
 export ALERT_HTF_TIMEFRAME=4h
 export ALERT_DIRECTION=both
@@ -36,12 +35,24 @@ export ALERT_DIRECTION=both
 Optional tuning:
 
 ```bash
-export ALERT_SCAN_SECONDS=60
+export ALERT_SCAN_SECONDS=180
 export ALERT_COOLDOWN_SECONDS=21600
 export ALERT_RETEST_TOLERANCE_PCT=0.001
 export ALERT_MIN_ADX_LONG=30
 export ALERT_MIN_ADX_SHORT=25
 export ALERT_MIN_EMA_SPREAD_PCT=0.01
+
+# Universe mode:
+# top_marketcap_binance = auto Top-N market cap coins listed on Binance (default)
+# static = use ALERT_SYMBOLS list directly
+export ALERT_UNIVERSE_MODE=top_marketcap_binance
+export ALERT_TOP_N=100
+export ALERT_EXCLUDE_STABLECOINS=true
+export ALERT_QUOTE_ASSET=USDT
+export ALERT_UNIVERSE_REFRESH_SECONDS=21600
+
+# Only for static mode:
+export ALERT_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT
 ```
 
 ### 3. Test API
