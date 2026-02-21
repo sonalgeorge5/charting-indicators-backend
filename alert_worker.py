@@ -283,24 +283,47 @@ class EmaRetestAlertWorker:
 
         return []
 
-    def _fetch_binance_spot_symbols(self) -> set:
+    def _fetch_binance_listed_symbols(self) -> set:
         now = int(time.time())
         cached = self._binance_spot_cache
         if cached["symbols"] and now - int(cached["updated_at"]) < 3600:
             return cached["symbols"]
-        url = f"{BINANCE_SPOT_API}/exchangeInfo"
-        body = self._request_json(url)
+
         out = set()
-        for s in body.get("symbols", []):
-            if s.get("status") != "TRADING":
-                continue
-            if s.get("quoteAsset") != self.cfg.quote_asset:
-                continue
-            if not s.get("isSpotTradingAllowed", True):
-                continue
-            sym = str(s.get("symbol", "")).upper()
-            if sym:
-                out.add(sym)
+
+        # Spot listing lookup (can be region-blocked in some Render regions).
+        try:
+            body = self._request_json(f"{BINANCE_SPOT_API}/exchangeInfo")
+            for s in body.get("symbols", []):
+                if s.get("status") != "TRADING":
+                    continue
+                if s.get("quoteAsset") != self.cfg.quote_asset:
+                    continue
+                if not s.get("isSpotTradingAllowed", True):
+                    continue
+                sym = str(s.get("symbol", "")).upper()
+                if sym:
+                    out.add(sym)
+        except Exception:
+            pass
+
+        # Futures listing fallback.
+        try:
+            body = self._request_json(f"{BINANCE_FUTURES_API}/exchangeInfo")
+            for s in body.get("symbols", []):
+                if s.get("status") != "TRADING":
+                    continue
+                if s.get("quoteAsset") != self.cfg.quote_asset:
+                    continue
+                sym = str(s.get("symbol", "")).upper()
+                if sym:
+                    out.add(sym)
+        except Exception:
+            pass
+
+        if not out:
+            raise RuntimeError("could not fetch Binance symbol universe")
+
         self._binance_spot_cache = {"symbols": out, "updated_at": now}
         return out
 
@@ -323,7 +346,7 @@ class EmaRetestAlertWorker:
         return False
 
     def _fetch_top_marketcap_binance_symbols(self) -> List[str]:
-        listed = self._fetch_binance_spot_symbols()
+        listed = self._fetch_binance_listed_symbols()
         if not listed:
             return []
 
