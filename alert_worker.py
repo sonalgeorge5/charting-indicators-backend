@@ -332,7 +332,7 @@ class EmaRetestAlertWorker:
         # If exchangeInfo is blocked, use ticker endpoints as a fast symbol listing fallback.
         if not out:
             try:
-                rows = self._request_json(f"{BINANCE_SPOT_API}/ticker/price", timeout=8)
+                rows = self._request_json(f"{BINANCE_SPOT_API}/ticker/price", timeout=20)
                 if isinstance(rows, list):
                     for r in rows:
                         sym = str(r.get("symbol", "")).upper()
@@ -341,7 +341,7 @@ class EmaRetestAlertWorker:
             except Exception:
                 pass
             try:
-                rows = self._request_json(f"{BINANCE_FUTURES_API}/ticker/price", timeout=8)
+                rows = self._request_json(f"{BINANCE_FUTURES_API}/ticker/price", timeout=20)
                 if isinstance(rows, list):
                     for r in rows:
                         sym = str(r.get("symbol", "")).upper()
@@ -378,12 +378,16 @@ class EmaRetestAlertWorker:
             "usdt", "usdc", "busd", "dai", "tusd", "fdusd", "usde", "usdd",
             "usdp", "frax", "lusd", "susd", "gusd", "pyusd", "rlusd",
             "eurt", "eurs", "eurc",
+            "usds", "susde", "susds", "usdtb", "usdf", "usd0", "usd1", "usdb",
+            "usdx", "usdy", "usdl", "usdm", "usdn", "usdo", "usdz",
         }
         if sym in stable_syms:
             return True
+        if "usd" in sym and (sym.startswith("usd") or sym.endswith("usd")):
+            return True
         stable_name_keys = [
             "stablecoin", "usd coin", "tether", "trueusd", "first digital usd",
-            "pax dollar", "paypal usd", "digital usd",
+            "pax dollar", "paypal usd", "digital usd", "synthetic usd", "wrapped usd",
         ]
         if any(k in nm for k in stable_name_keys):
             return True
