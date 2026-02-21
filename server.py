@@ -440,11 +440,10 @@ async def alerts_status():
 
 @app.post("/alerts/scan-now")
 async def alerts_scan_now():
-    sent = await ALERT_WORKER.scan_once_async()
+    queued = await ALERT_WORKER.trigger_scan_async()
     return {
         "ok": True,
-        "sent_count": len(sent),
-        "sent": sent,
+        "queued": queued,
         "status": ALERT_WORKER.status(),
     }
 

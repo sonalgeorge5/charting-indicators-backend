@@ -171,6 +171,8 @@ class EmaRetestAlertWorker:
     def __init__(self, cfg: AlertConfig):
         self.cfg = cfg
         self._task: Optional[asyncio.Task] = None
+        self._manual_scan_task: Optional[asyncio.Task] = None
+        self._scan_lock = asyncio.Lock()
         self._running = False
         self._last_error: Optional[str] = None
         self._last_scan_at: Optional[int] = None
@@ -194,14 +196,19 @@ class EmaRetestAlertWorker:
         except Exception:
             pass
 
-    def _request_json(self, url: str, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+    def _request_json(
+        self,
+        url: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+        timeout: int = 12,
+    ) -> Any:
         headers = {}
         if self.cfg.binance_api_key:
             headers["X-MBX-APIKEY"] = self.cfg.binance_api_key
         if extra_headers:
             headers.update(extra_headers)
         req = Request(url, headers=headers, method="GET")
-        with urlopen(req, timeout=12) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def _post_form(self, url: str, payload: Dict[str, Any]) -> Any:
@@ -322,6 +329,27 @@ class EmaRetestAlertWorker:
         except Exception:
             pass
 
+        # If exchangeInfo is blocked, use ticker endpoints as a fast symbol listing fallback.
+        if not out:
+            try:
+                rows = self._request_json(f"{BINANCE_SPOT_API}/ticker/price", timeout=8)
+                if isinstance(rows, list):
+                    for r in rows:
+                        sym = str(r.get("symbol", "")).upper()
+                        if sym.endswith(self.cfg.quote_asset):
+                            out.add(sym)
+            except Exception:
+                pass
+            try:
+                rows = self._request_json(f"{BINANCE_FUTURES_API}/ticker/price", timeout=8)
+                if isinstance(rows, list):
+                    for r in rows:
+                        sym = str(r.get("symbol", "")).upper()
+                        if sym.endswith(self.cfg.quote_asset):
+                            out.add(sym)
+            except Exception:
+                pass
+
         self._binance_spot_cache = {"symbols": out, "updated_at": now}
         return out
 
@@ -329,14 +357,14 @@ class EmaRetestAlertWorker:
         # Probe Binance spot then futures directly when exchangeInfo is blocked.
         try:
             q = urlencode({"symbol": pair, "interval": interval, "limit": 1})
-            rows = self._request_json(f"{BINANCE_SPOT_API}/klines?{q}")
+            rows = self._request_json(f"{BINANCE_SPOT_API}/klines?{q}", timeout=3)
             if isinstance(rows, list) and rows:
                 return True
         except Exception:
             pass
         try:
             q = urlencode({"symbol": pair, "interval": interval, "limit": 1})
-            rows = self._request_json(f"{BINANCE_FUTURES_API}/klines?{q}")
+            rows = self._request_json(f"{BINANCE_FUTURES_API}/klines?{q}", timeout=3)
             if isinstance(rows, list) and rows:
                 return True
         except Exception:
@@ -367,7 +395,12 @@ class EmaRetestAlertWorker:
 
         selected: List[str] = []
         seen_base = set()
+        probe_attempts = 0
+        probe_limit = 12
+        used_optimistic_pairs = False
+
         def build_from_candidates(candidates: List[Dict[str, str]]) -> List[str]:
+            nonlocal probe_attempts, used_optimistic_pairs
             for coin in candidates:
                 base = str(coin.get("symbol", "")).upper()
                 name = str(coin.get("name", ""))
@@ -380,8 +413,13 @@ class EmaRetestAlertWorker:
                     if pair not in listed:
                         continue
                 else:
-                    if not self._is_binance_pair_supported(pair, self.cfg.timeframe):
-                        continue
+                    if probe_attempts < probe_limit:
+                        probe_attempts += 1
+                        if not self._is_binance_pair_supported(pair, self.cfg.timeframe):
+                            continue
+                    else:
+                        # Do not stall universe refresh indefinitely when Binance region-blocks probes.
+                        used_optimistic_pairs = True
                 selected.append(pair)
                 seen_base.add(base)
                 if len(selected) >= self.cfg.top_n:
@@ -400,7 +438,11 @@ class EmaRetestAlertWorker:
                     "sparkline": "false",
                 })
                 url = f"https://api.coingecko.com/api/v3/coins/markets?{q}"
-                rows = self._request_json(url, extra_headers={"accept": "application/json", "user-agent": "charting-alert-worker/1.0"})
+                rows = self._request_json(
+                    url,
+                    extra_headers={"accept": "application/json", "user-agent": "charting-alert-worker/1.0"},
+                    timeout=8,
+                )
                 if not isinstance(rows, list) or not rows:
                     break
                 for r in rows:
@@ -410,7 +452,7 @@ class EmaRetestAlertWorker:
             return coins
 
         def fetch_coinpaprika() -> List[Dict[str, str]]:
-            rows = self._request_json("https://api.coinpaprika.com/v1/tickers?quotes=USD")
+            rows = self._request_json("https://api.coinpaprika.com/v1/tickers?quotes=USD", timeout=8)
             if not isinstance(rows, list):
                 return []
             rows.sort(key=lambda x: int(x.get("rank", 10_000_000)))
@@ -421,7 +463,7 @@ class EmaRetestAlertWorker:
 
         def fetch_coinlore() -> List[Dict[str, str]]:
             q = urlencode({"start": 0, "limit": 400})
-            body = self._request_json(f"https://api.coinlore.net/api/tickers/?{q}")
+            body = self._request_json(f"https://api.coinlore.net/api/tickers/?{q}", timeout=8)
             rows = body.get("data", []) if isinstance(body, dict) else []
             if not isinstance(rows, list):
                 return []
@@ -444,7 +486,7 @@ class EmaRetestAlertWorker:
                     continue
                 out = build_from_candidates(candidates)
                 if out:
-                    self._last_universe_source = source_name
+                    self._last_universe_source = f"{source_name}_optimistic" if used_optimistic_pairs else source_name
                     return out
             except Exception as exc:
                 last_err = f"{source_name}: {exc}"
@@ -661,7 +703,22 @@ class EmaRetestAlertWorker:
         return sent
 
     async def scan_once_async(self) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(self.scan_once)
+        async with self._scan_lock:
+            return await asyncio.to_thread(self.scan_once)
+
+    def _on_manual_scan_done(self, task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception as exc:
+            self._last_error = f"manual_scan: {exc}"
+
+    async def trigger_scan_async(self) -> bool:
+        if self._manual_scan_task and not self._manual_scan_task.done():
+            return False
+        task = asyncio.create_task(self.scan_once_async())
+        task.add_done_callback(self._on_manual_scan_done)
+        self._manual_scan_task = task
+        return True
 
     async def send_test_async(self) -> bool:
         self._refresh_symbol_universe(force=True)
@@ -724,5 +781,7 @@ class EmaRetestAlertWorker:
             "telegram_chat_id_set": bool(self.cfg.telegram_chat_id),
             "last_scan_at": self._last_scan_at,
             "last_error": self._last_error,
+            "scan_in_progress": self._scan_lock.locked(),
+            "manual_scan_queued": bool(self._manual_scan_task and not self._manual_scan_task.done()),
             "state_path": str(self.cfg.state_path),
         }
