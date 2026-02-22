@@ -84,7 +84,7 @@ class SaveRequest(BaseModel):
 
 class IndicatorResponse(BaseModel):
     success: bool
-    data: Optional[Dict[str, List[float]]] = None
+    data: Optional[Dict[str, List[Optional[float]]]] = None
     signals: Optional[Dict[str, List[bool]]] = None
     overlay: bool = False
     error: Optional[str] = None
@@ -193,6 +193,14 @@ def execute_script(module, df: pd.DataFrame, params: Dict[str, Any]) -> Indicato
         data = {}
         signals = {}
         
+        def _to_float_or_none(x: Any) -> Optional[float]:
+            if pd.isna(x):
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
         if isinstance(result, dict):
             for key, value in result.items():
                 if key == 'signals' and isinstance(value, dict):
@@ -201,16 +209,16 @@ def execute_script(module, df: pd.DataFrame, params: Dict[str, Any]) -> Indicato
                         if isinstance(sig_data, pd.Series):
                             signals[sig_name] = sig_data.fillna(False).astype(bool).tolist()
                 elif isinstance(value, pd.Series):
-                    data[key] = value.where(pd.notnull(value), None).tolist()
+                    data[key] = [_to_float_or_none(x) for x in value.tolist()]
                 elif isinstance(value, (list, np.ndarray)):
-                    data[key] = [float(x) if not np.isnan(x) else None for x in value]
+                    data[key] = [_to_float_or_none(x) for x in value]
                 elif isinstance(value, (int, float)):
-                    data[key] = [value] * len(df)
+                    data[key] = [float(value)] * len(df)
         elif isinstance(result, pd.Series):
-            data['value'] = result.where(pd.notnull(result), None).tolist()
+            data['value'] = [_to_float_or_none(x) for x in result.tolist()]
         elif isinstance(result, pd.DataFrame):
             for col in result.columns:
-                data[col] = result[col].where(pd.notnull(result[col]), None).tolist()
+                data[col] = [_to_float_or_none(x) for x in result[col].tolist()]
         
         return IndicatorResponse(
             success=True,
