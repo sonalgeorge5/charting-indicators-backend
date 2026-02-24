@@ -258,13 +258,15 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     await ALERT_WORKER.start()
-    await VISION_BACKFILL.start()
+    if VISION_CONFIG.worker_enabled:
+        await VISION_BACKFILL.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await ALERT_WORKER.stop()
-    await VISION_BACKFILL.stop()
+    if VISION_CONFIG.worker_enabled:
+        await VISION_BACKFILL.stop()
 
 
 @app.get("/vision/status")
@@ -277,6 +279,11 @@ async def vision_status():
             "oldest_backfill_month": VISION_CONFIG.oldest_backfill_month,
             "worker_interval_seconds": VISION_CONFIG.worker_interval_seconds,
             "bootstrap_days_on_demand": VISION_CONFIG.bootstrap_days_on_demand,
+            "worker_enabled": VISION_CONFIG.worker_enabled,
+            "low_memory_mode": VISION_CONFIG.low_memory_mode,
+            "normalize_on_start": VISION_CONFIG.normalize_on_start,
+            "max_zip_download_bytes": VISION_CONFIG.max_zip_download_bytes,
+            "klines_seed_seconds": VISION_CONFIG.klines_seed_seconds,
         },
         "status": VISION_CACHE.status(),
         "supported_symbols": sorted(SUPPORTED_SYMBOLS),
@@ -285,13 +292,27 @@ async def vision_status():
 
 
 @app.post("/vision/bootstrap")
-async def vision_bootstrap(symbol: Optional[str] = None, days: Optional[int] = None):
+async def vision_bootstrap(
+    symbol: Optional[str] = None,
+    days: Optional[int] = None,
+    full: bool = False,
+):
     symbols = [symbol.upper()] if symbol else sorted(SUPPORTED_SYMBOLS)
     added: Dict[str, int] = {}
     for s in symbols:
         if s not in SUPPORTED_SYMBOLS:
             continue
-        count = await VISION_BACKFILL.ensure_recent(s, days=days)
+        if full and not VISION_CONFIG.low_memory_mode:
+            count = await VISION_BACKFILL.ensure_recent(s, days=days)
+        else:
+            now_s = int(datetime.utcnow().timestamp())
+            seed_seconds = VISION_CONFIG.klines_seed_seconds
+            count = VISION_CACHE.seed_range_from_binance_klines(
+                s,
+                max(0, now_s - seed_seconds),
+                now_s,
+                max_points=12000,
+            )
         if count == 0:
             # Fallback short seed from Binance 1s klines for immediate chart usability.
             count = VISION_CACHE.seed_recent_from_binance_klines(s, seconds=3600)
@@ -329,7 +350,10 @@ async def get_candles(
     )
     if not rows:
         # On-demand bootstrap for first request on fresh deployment.
-        await VISION_BACKFILL.ensure_recent(sym, days=VISION_CONFIG.bootstrap_days_on_demand)
+        if VISION_CONFIG.low_memory_mode:
+            VISION_CACHE.seed_range_from_binance_klines(sym, from_s, to_s, max_points=12000)
+        else:
+            await VISION_BACKFILL.ensure_recent(sym, days=VISION_CONFIG.bootstrap_days_on_demand)
         rows = VISION_CACHE.get_candles(
             symbol=sym,
             interval=tf,

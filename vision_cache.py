@@ -44,15 +44,31 @@ class VisionConfig:
     worker_interval_seconds: int
     bootstrap_days_on_demand: int
     request_timeout_seconds: int
+    worker_enabled: bool
+    low_memory_mode: bool
+    normalize_on_start: bool
+    max_zip_download_bytes: int
+    klines_seed_seconds: int
 
     @staticmethod
     def from_env() -> "VisionConfig":
+        def _env_bool(key: str, default: bool) -> bool:
+            raw = os.getenv(key)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
         db_path = os.getenv("VISION_DB_PATH", "./data/vision_candles.db")
-        recent_days = int(os.getenv("VISION_RECENT_DAYS", "3"))
+        recent_days = int(os.getenv("VISION_RECENT_DAYS", "1"))
         oldest_backfill_month = os.getenv("VISION_OLDEST_BACKFILL_MONTH", "2017-09")
-        worker_interval_seconds = int(os.getenv("VISION_WORKER_INTERVAL_SECONDS", "20"))
-        bootstrap_days_on_demand = int(os.getenv("VISION_BOOTSTRAP_DAYS_ON_DEMAND", "2"))
+        worker_interval_seconds = int(os.getenv("VISION_WORKER_INTERVAL_SECONDS", "60"))
+        bootstrap_days_on_demand = int(os.getenv("VISION_BOOTSTRAP_DAYS_ON_DEMAND", "1"))
         request_timeout_seconds = int(os.getenv("VISION_REQUEST_TIMEOUT_SECONDS", "20"))
+        worker_enabled = _env_bool("VISION_WORKER_ENABLED", False)
+        low_memory_mode = _env_bool("VISION_LOW_MEMORY_MODE", True)
+        normalize_on_start = _env_bool("VISION_NORMALIZE_ON_START", False)
+        max_zip_download_bytes = int(os.getenv("VISION_MAX_ZIP_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
+        klines_seed_seconds = int(os.getenv("VISION_KLINES_SEED_SECONDS", str(6 * 60 * 60)))
         return VisionConfig(
             db_path=db_path,
             recent_days=max(1, recent_days),
@@ -60,6 +76,11 @@ class VisionConfig:
             worker_interval_seconds=max(5, worker_interval_seconds),
             bootstrap_days_on_demand=max(1, bootstrap_days_on_demand),
             request_timeout_seconds=max(5, request_timeout_seconds),
+            worker_enabled=worker_enabled,
+            low_memory_mode=low_memory_mode,
+            normalize_on_start=normalize_on_start,
+            max_zip_download_bytes=max(1_000_000, max_zip_download_bytes),
+            klines_seed_seconds=max(600, klines_seed_seconds),
         )
 
 
@@ -88,7 +109,8 @@ class VisionCandleCache:
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.cfg.db_path) or ".", exist_ok=True)
         self._init_db()
-        self._normalize_existing_candle_times()
+        if self.cfg.normalize_on_start:
+            self._normalize_existing_candle_times()
 
     @contextmanager
     def _conn(self):
@@ -320,7 +342,24 @@ class VisionCandleCache:
     def _download_zip(self, url: str) -> Optional[bytes]:
         try:
             with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
-                return resp.read()
+                content_length = resp.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > self.cfg.max_zip_download_bytes:
+                            return None
+                    except Exception:
+                        pass
+                chunks: List[bytes] = []
+                total = 0
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.cfg.max_zip_download_bytes:
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
         except HTTPError as exc:
             if exc.code == 404:
                 return None
@@ -564,47 +603,82 @@ class VisionCandleCache:
             return self._query_1s(symbol, from_ts, to_ts, limit)
         return self._query_aggregated(symbol, from_ts, to_ts, SUPPORTED_INTERVALS[interval], limit)
 
+    def seed_range_from_binance_klines(
+        self,
+        symbol: str,
+        from_ts: int,
+        to_ts: int,
+        max_points: int = 12000,
+    ) -> int:
+        if symbol not in SUPPORTED_SYMBOLS:
+            return 0
+        if to_ts < from_ts:
+            return 0
+        max_points = max(1, min(20000, max_points))
+        cursor_ms = from_ts * 1000
+        end_ms = to_ts * 1000
+        total = 0
+        batch_rows: List[Tuple[int, float, float, float, float, float, int]] = []
+
+        while cursor_ms <= end_ms and total < max_points:
+            batch_limit = min(1000, max_points - total)
+            req_end_ms = min(end_ms, cursor_ms + (batch_limit - 1) * 1000)
+            url = (
+                f"{BINANCE_SPOT_KLINES}?symbol={symbol}&interval=1s"
+                f"&startTime={cursor_ms}&endTime={req_end_ms}&limit={batch_limit}"
+            )
+            try:
+                with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
+                    data = resp.read().decode("utf-8")
+            except Exception:
+                break
+            try:
+                import json
+
+                rows = json.loads(data)
+            except Exception:
+                break
+            if not isinstance(rows, list) or not rows:
+                break
+
+            last_open_ms = None
+            for k in rows:
+                try:
+                    sec = int(k[0]) // 1000
+                    batch_rows.append(
+                        (
+                            sec,
+                            float(k[1]),
+                            float(k[2]),
+                            float(k[3]),
+                            float(k[4]),
+                            float(k[5]),
+                            0,
+                        )
+                    )
+                    total += 1
+                    last_open_ms = int(k[0])
+                except Exception:
+                    continue
+
+            if last_open_ms is None:
+                break
+            next_cursor = last_open_ms + 1000
+            if next_cursor <= cursor_ms:
+                break
+            cursor_ms = next_cursor
+
+        if batch_rows:
+            self._insert_batch(symbol, batch_rows)
+            self._set_progress_message(symbol, f"seeded from klines +{len(batch_rows)}")
+        return len(batch_rows)
+
     def seed_recent_from_binance_klines(self, symbol: str, seconds: int = 3600) -> int:
         if symbol not in SUPPORTED_SYMBOLS:
             return 0
-        end_ms = int(time.time() * 1000)
-        start_ms = end_ms - seconds * 1000
-        url = (
-            f"{BINANCE_SPOT_KLINES}?symbol={symbol}&interval=1s&startTime={start_ms}&endTime={end_ms}&limit=1000"
-        )
-        try:
-            with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
-                data = resp.read().decode("utf-8")
-        except Exception:
-            return 0
-        try:
-            import json
-
-            rows = json.loads(data)
-        except Exception:
-            return 0
-        batch: List[Tuple[int, float, float, float, float, float, int]] = []
-        for k in rows:
-            try:
-                sec = int(k[0]) // 1000
-                batch.append(
-                    (
-                        sec,
-                        float(k[1]),
-                        float(k[2]),
-                        float(k[3]),
-                        float(k[4]),
-                        float(k[5]),
-                        0,
-                    )
-                )
-            except Exception:
-                continue
-        if not batch:
-            return 0
-        self._insert_batch(symbol, batch)
-        self._set_progress_message(symbol, f"seeded from klines +{len(batch)}")
-        return len(batch)
+        now_sec = int(time.time())
+        start_sec = max(0, now_sec - max(1, seconds))
+        return self.seed_range_from_binance_klines(symbol, start_sec, now_sec, max_points=12000)
 
 
 class VisionBackfillService:
@@ -617,6 +691,8 @@ class VisionBackfillService:
         self._symbols = sorted(SUPPORTED_SYMBOLS)
 
     async def start(self) -> None:
+        if not self.cfg.worker_enabled:
+            return
         if self._task and not self._task.done():
             return
         self._stop.clear()
@@ -629,12 +705,28 @@ class VisionBackfillService:
             self._task = None
 
     async def ensure_recent(self, symbol: str, days: Optional[int] = None) -> int:
+        if self.cfg.low_memory_mode:
+            return await asyncio.to_thread(
+                self.cache.seed_recent_from_binance_klines,
+                symbol,
+                self.cfg.klines_seed_seconds,
+            )
         d = days if days is not None else self.cfg.bootstrap_days_on_demand
         return await asyncio.to_thread(self.cache.ingest_recent_days, symbol, d)
 
     async def _run_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if self.cfg.low_memory_mode:
+                    for symbol in self._symbols:
+                        await asyncio.to_thread(
+                            self.cache.seed_recent_from_binance_klines,
+                            symbol,
+                            self.cfg.klines_seed_seconds,
+                        )
+                    await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.worker_interval_seconds)
+                    continue
+
                 # Keep recent data warm for all symbols.
                 for symbol in self._symbols:
                     await asyncio.to_thread(self.cache.ingest_recent_days, symbol, self.cfg.recent_days)
