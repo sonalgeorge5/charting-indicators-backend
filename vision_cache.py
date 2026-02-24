@@ -1,0 +1,573 @@
+import asyncio
+import csv
+import io
+import os
+import sqlite3
+import threading
+import time
+import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+
+
+SUPPORTED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+SUPPORTED_INTERVALS: Dict[str, int] = {
+    "1s": 1,
+    "5s": 5,
+    "15s": 15,
+    "30s": 30,
+    "45s": 45,
+    "1m": 60,
+    "2m": 120,
+    "3m": 180,
+    "5m": 300,
+}
+
+VISION_SPOT_DAILY_TRADES = (
+    "https://data.binance.vision/data/spot/daily/trades/{symbol}/{symbol}-trades-{day}.zip"
+)
+VISION_SPOT_MONTHLY_TRADES = (
+    "https://data.binance.vision/data/spot/monthly/trades/{symbol}/{symbol}-trades-{month}.zip"
+)
+BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines"
+
+
+@dataclass
+class VisionConfig:
+    db_path: str
+    recent_days: int
+    oldest_backfill_month: str
+    worker_interval_seconds: int
+    bootstrap_days_on_demand: int
+    request_timeout_seconds: int
+
+    @staticmethod
+    def from_env() -> "VisionConfig":
+        db_path = os.getenv("VISION_DB_PATH", "./data/vision_candles.db")
+        recent_days = int(os.getenv("VISION_RECENT_DAYS", "3"))
+        oldest_backfill_month = os.getenv("VISION_OLDEST_BACKFILL_MONTH", "2017-09")
+        worker_interval_seconds = int(os.getenv("VISION_WORKER_INTERVAL_SECONDS", "20"))
+        bootstrap_days_on_demand = int(os.getenv("VISION_BOOTSTRAP_DAYS_ON_DEMAND", "2"))
+        request_timeout_seconds = int(os.getenv("VISION_REQUEST_TIMEOUT_SECONDS", "20"))
+        return VisionConfig(
+            db_path=db_path,
+            recent_days=max(1, recent_days),
+            oldest_backfill_month=oldest_backfill_month,
+            worker_interval_seconds=max(5, worker_interval_seconds),
+            bootstrap_days_on_demand=max(1, bootstrap_days_on_demand),
+            request_timeout_seconds=max(5, request_timeout_seconds),
+        )
+
+
+def _month_string(dt: date) -> str:
+    return dt.strftime("%Y-%m")
+
+
+def _prev_month(month_str: str) -> str:
+    dt = datetime.strptime(f"{month_str}-01", "%Y-%m-%d").date()
+    first = dt.replace(day=1)
+    prev_last = first - timedelta(days=1)
+    return _month_string(prev_last)
+
+
+def _to_utc_date(ts_seconds: int) -> date:
+    return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).date()
+
+
+def _to_epoch_seconds(dt: datetime) -> int:
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
+class VisionCandleCache:
+    def __init__(self, cfg: VisionConfig) -> None:
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(self.cfg.db_path) or ".", exist_ok=True)
+        self._init_db()
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self.cfg.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._conn() as conn:
+            conn.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS candles_1s (
+                    symbol TEXT NOT NULL,
+                    time INTEGER NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    trades INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (symbol, time)
+                );
+
+                CREATE TABLE IF NOT EXISTS ingested_files (
+                    file_key TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    processed_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS symbol_progress (
+                    symbol TEXT PRIMARY KEY,
+                    recent_bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                    backfill_cursor_month TEXT NOT NULL,
+                    last_recent_sync_at INTEGER,
+                    last_backfill_sync_at INTEGER,
+                    last_message TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles_1s(symbol, time);
+                """
+            )
+
+            today = datetime.now(timezone.utc).date()
+            recent_start = today - timedelta(days=max(1, self.cfg.recent_days) - 1)
+            start_backfill_month = _prev_month(_month_string(recent_start))
+            for symbol in SUPPORTED_SYMBOLS:
+                conn.execute(
+                    """
+                    INSERT INTO symbol_progress (symbol, backfill_cursor_month)
+                    VALUES (?, ?)
+                    ON CONFLICT(symbol) DO NOTHING
+                    """,
+                    (symbol, start_backfill_month),
+                )
+
+    def _is_ingested(self, file_key: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM ingested_files WHERE file_key = ?",
+                (file_key,),
+            ).fetchone()
+            return row is not None
+
+    def _mark_ingested(self, file_key: str, symbol: str, source: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ingested_files (file_key, symbol, source, processed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (file_key, symbol, source, int(time.time())),
+            )
+
+    def _set_progress_message(self, symbol: str, message: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE symbol_progress SET last_message = ? WHERE symbol = ?",
+                (message, symbol),
+            )
+
+    def _set_recent_done(self, symbol: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE symbol_progress
+                SET recent_bootstrap_done = 1, last_recent_sync_at = ?, last_message = ?
+                WHERE symbol = ?
+                """,
+                (int(time.time()), "recent bootstrap completed", symbol),
+            )
+
+    def _advance_backfill_month(self, symbol: str, next_month: str, message: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE symbol_progress
+                SET backfill_cursor_month = ?, last_backfill_sync_at = ?, last_message = ?
+                WHERE symbol = ?
+                """,
+                (next_month, int(time.time()), message, symbol),
+            )
+
+    def status(self) -> Dict[str, Any]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, recent_bootstrap_done, backfill_cursor_month,
+                       last_recent_sync_at, last_backfill_sync_at, last_message
+                FROM symbol_progress
+                ORDER BY symbol
+                """
+            ).fetchall()
+            counts = conn.execute(
+                """
+                SELECT symbol, COUNT(*) AS candle_count, MIN(time) AS min_time, MAX(time) AS max_time
+                FROM candles_1s
+                GROUP BY symbol
+                """
+            ).fetchall()
+
+        count_map = {r["symbol"]: dict(r) for r in counts}
+        out = []
+        for r in rows:
+            c = count_map.get(r["symbol"], {})
+            out.append(
+                {
+                    "symbol": r["symbol"],
+                    "recent_bootstrap_done": bool(r["recent_bootstrap_done"]),
+                    "backfill_cursor_month": r["backfill_cursor_month"],
+                    "last_recent_sync_at": r["last_recent_sync_at"],
+                    "last_backfill_sync_at": r["last_backfill_sync_at"],
+                    "last_message": r["last_message"],
+                    "candle_count_1s": c.get("candle_count", 0),
+                    "min_time": c.get("min_time"),
+                    "max_time": c.get("max_time"),
+                }
+            )
+        return {
+            "db_path": self.cfg.db_path,
+            "symbols": out,
+        }
+
+    def _download_zip(self, url: str) -> Optional[bytes]:
+        try:
+            with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
+                return resp.read()
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+        except URLError:
+            return None
+
+    def _insert_batch(self, symbol: str, rows: Iterable[Tuple[int, float, float, float, float, float, int]]) -> None:
+        with self._conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO candles_1s (symbol, time, open, high, low, close, volume, trades)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, time) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    trades = excluded.trades
+                """,
+                [(symbol, *r) for r in rows],
+            )
+
+    def _ingest_trade_zip(self, symbol: str, zip_bytes: bytes, file_key: str, source: str) -> int:
+        if self._is_ingested(file_key):
+            return 0
+
+        with self._lock:
+            if self._is_ingested(file_key):
+                return 0
+
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                names = zf.namelist()
+                if not names:
+                    return 0
+                name = names[0]
+
+                batch: List[Tuple[int, float, float, float, float, float, int]] = []
+                inserted = 0
+                current_sec: Optional[int] = None
+                o = h = l = c = v = 0.0
+                trades = 0
+
+                with zf.open(name, "r") as fp:
+                    reader = csv.reader(io.TextIOWrapper(fp, encoding="utf-8"))
+                    for row in reader:
+                        if not row:
+                            continue
+                        if row[0].lower() in {"id", "agg_trade_id"}:
+                            continue
+                        if len(row) < 5:
+                            continue
+                        try:
+                            price = float(row[1])
+                            qty = float(row[2])
+                        except Exception:
+                            continue
+
+                        ts_ms: Optional[int] = None
+                        for idx in (4, 5):
+                            if idx >= len(row):
+                                continue
+                            try:
+                                cand = int(float(row[idx]))
+                            except Exception:
+                                continue
+                            if cand > 1_000_000_000_000:
+                                ts_ms = cand
+                                break
+                        if ts_ms is None:
+                            continue
+
+                        sec = ts_ms // 1000
+                        if current_sec is None:
+                            current_sec = sec
+                            o = h = l = c = price
+                            v = qty
+                            trades = 1
+                            continue
+
+                        if sec == current_sec:
+                            h = max(h, price)
+                            l = min(l, price)
+                            c = price
+                            v += qty
+                            trades += 1
+                            continue
+
+                        batch.append((current_sec, o, h, l, c, v, trades))
+                        if len(batch) >= 10000:
+                            self._insert_batch(symbol, batch)
+                            inserted += len(batch)
+                            batch.clear()
+
+                        current_sec = sec
+                        o = h = l = c = price
+                        v = qty
+                        trades = 1
+
+                if current_sec is not None:
+                    batch.append((current_sec, o, h, l, c, v, trades))
+                if batch:
+                    self._insert_batch(symbol, batch)
+                    inserted += len(batch)
+
+            self._mark_ingested(file_key, symbol, source)
+            return inserted
+
+    def ingest_recent_days(self, symbol: str, days: int) -> int:
+        if symbol not in SUPPORTED_SYMBOLS:
+            return 0
+        total = 0
+        today = datetime.now(timezone.utc).date()
+        for d in range(days):
+            day = today - timedelta(days=d)
+            day_str = day.strftime("%Y-%m-%d")
+            key = f"daily:{symbol}:{day_str}"
+            if self._is_ingested(key):
+                continue
+            url = VISION_SPOT_DAILY_TRADES.format(symbol=symbol, day=day_str)
+            blob = self._download_zip(url)
+            if not blob:
+                continue
+            total += self._ingest_trade_zip(symbol, blob, key, "daily")
+        if total > 0:
+            self._set_progress_message(symbol, f"recent ingest +{total} candles")
+        self._set_recent_done(symbol)
+        return total
+
+    def backfill_month_step(self, symbol: str) -> int:
+        if symbol not in SUPPORTED_SYMBOLS:
+            return 0
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT backfill_cursor_month FROM symbol_progress WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+        if not row:
+            return 0
+        month = row["backfill_cursor_month"]
+        if month < self.cfg.oldest_backfill_month:
+            self._set_progress_message(symbol, "backfill completed")
+            return 0
+
+        key = f"monthly:{symbol}:{month}"
+        inserted = 0
+        if not self._is_ingested(key):
+            url = VISION_SPOT_MONTHLY_TRADES.format(symbol=symbol, month=month)
+            blob = self._download_zip(url)
+            if blob:
+                inserted = self._ingest_trade_zip(symbol, blob, key, "monthly")
+
+        next_month = _prev_month(month)
+        self._advance_backfill_month(symbol, next_month, f"backfilled {month} (+{inserted})")
+        return inserted
+
+    def _query_1s(
+        self,
+        symbol: str,
+        from_ts: int,
+        to_ts: int,
+        limit: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            sql = """
+                SELECT time, open, high, low, close, volume, trades
+                FROM candles_1s
+                WHERE symbol = ? AND time >= ? AND time <= ?
+                ORDER BY time ASC
+            """
+            params: List[Any] = [symbol, from_ts, to_ts]
+            if limit is not None and limit > 0:
+                sql += " LIMIT ?"
+                params.append(limit)
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _query_aggregated(
+        self,
+        symbol: str,
+        from_ts: int,
+        to_ts: int,
+        bucket_seconds: int,
+        limit: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            sql = """
+                WITH bucketed AS (
+                    SELECT
+                        ((time / :bucket) * :bucket) AS bucket_time,
+                        time, open, high, low, close, volume
+                    FROM candles_1s
+                    WHERE symbol = :symbol AND time >= :from_ts AND time <= :to_ts
+                ),
+                ranked AS (
+                    SELECT
+                        bucket_time, time, open, high, low, close, volume,
+                        ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time ASC) AS rn_open,
+                        ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time DESC) AS rn_close
+                    FROM bucketed
+                )
+                SELECT
+                    bucket_time AS time,
+                    MAX(CASE WHEN rn_open = 1 THEN open END) AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    MAX(CASE WHEN rn_close = 1 THEN close END) AS close,
+                    SUM(volume) AS volume
+                FROM ranked
+                GROUP BY bucket_time
+                ORDER BY bucket_time ASC
+            """
+            if limit is not None and limit > 0:
+                sql += " LIMIT :limit"
+            params = {
+                "symbol": symbol,
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "bucket": bucket_seconds,
+                "limit": limit if limit is not None else -1,
+            }
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_candles(
+        self,
+        symbol: str,
+        interval: str,
+        from_ts: int,
+        to_ts: int,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if symbol not in SUPPORTED_SYMBOLS:
+            return []
+        if interval not in SUPPORTED_INTERVALS:
+            return []
+        if to_ts < from_ts:
+            return []
+        if interval == "1s":
+            return self._query_1s(symbol, from_ts, to_ts, limit)
+        return self._query_aggregated(symbol, from_ts, to_ts, SUPPORTED_INTERVALS[interval], limit)
+
+    def seed_recent_from_binance_klines(self, symbol: str, seconds: int = 3600) -> int:
+        if symbol not in SUPPORTED_SYMBOLS:
+            return 0
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - seconds * 1000
+        url = (
+            f"{BINANCE_SPOT_KLINES}?symbol={symbol}&interval=1s&startTime={start_ms}&endTime={end_ms}&limit=1000"
+        )
+        try:
+            with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
+                data = resp.read().decode("utf-8")
+        except Exception:
+            return 0
+        try:
+            import json
+
+            rows = json.loads(data)
+        except Exception:
+            return 0
+        batch: List[Tuple[int, float, float, float, float, float, int]] = []
+        for k in rows:
+            try:
+                sec = int(k[0]) // 1000
+                batch.append(
+                    (
+                        sec,
+                        float(k[1]),
+                        float(k[2]),
+                        float(k[3]),
+                        float(k[4]),
+                        float(k[5]),
+                        0,
+                    )
+                )
+            except Exception:
+                continue
+        if not batch:
+            return 0
+        self._insert_batch(symbol, batch)
+        self._set_progress_message(symbol, f"seeded from klines +{len(batch)}")
+        return len(batch)
+
+
+class VisionBackfillService:
+    def __init__(self, cache: VisionCandleCache, cfg: VisionConfig) -> None:
+        self.cache = cache
+        self.cfg = cfg
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._symbol_index = 0
+        self._symbols = sorted(SUPPORTED_SYMBOLS)
+
+    async def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run_loop(), name="vision-backfill-loop")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await self._task
+            self._task = None
+
+    async def ensure_recent(self, symbol: str, days: Optional[int] = None) -> int:
+        d = days if days is not None else self.cfg.bootstrap_days_on_demand
+        return await asyncio.to_thread(self.cache.ingest_recent_days, symbol, d)
+
+    async def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                # Keep recent data warm for all symbols.
+                for symbol in self._symbols:
+                    await asyncio.to_thread(self.cache.ingest_recent_days, symbol, self.cfg.recent_days)
+
+                # Backfill one symbol per loop iteration for fairness.
+                symbol = self._symbols[self._symbol_index % len(self._symbols)]
+                self._symbol_index += 1
+                await asyncio.to_thread(self.cache.backfill_month_step, symbol)
+            except Exception as exc:
+                # Keep worker alive on transient failures.
+                for symbol in self._symbols:
+                    self.cache._set_progress_message(symbol, f"worker error: {type(exc).__name__}")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.worker_interval_seconds)
+            except asyncio.TimeoutError:
+                continue
+

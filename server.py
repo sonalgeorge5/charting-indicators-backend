@@ -3,7 +3,7 @@ CryptoChart Pro - Python Indicator Server
 FastAPI server for executing custom Python indicators
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Any, Optional
@@ -14,7 +14,15 @@ import os
 import importlib.util
 import traceback
 from pathlib import Path
+from datetime import datetime
 from alert_worker import AlertConfig, EmaRetestAlertWorker
+from vision_cache import (
+    SUPPORTED_INTERVALS,
+    SUPPORTED_SYMBOLS,
+    VisionBackfillService,
+    VisionCandleCache,
+    VisionConfig,
+)
 
 app = FastAPI(
     title="CryptoChart Pro Indicator Server",
@@ -58,6 +66,9 @@ SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 BUILTIN_DIR = Path(__file__).parent / "builtin"
 ALERT_CONFIG = AlertConfig.from_env()
 ALERT_WORKER = EmaRetestAlertWorker(ALERT_CONFIG)
+VISION_CONFIG = VisionConfig.from_env()
+VISION_CACHE = VisionCandleCache(VISION_CONFIG)
+VISION_BACKFILL = VisionBackfillService(VISION_CACHE, VISION_CONFIG)
 
 
 class OHLCVData(BaseModel):
@@ -240,17 +251,102 @@ async def root():
         "status": "running",
         "service": "CryptoChart Pro Indicator Server",
         "alerts": ALERT_WORKER.status(),
+        "vision": VISION_CACHE.status(),
     }
 
 
 @app.on_event("startup")
 async def startup_event():
     await ALERT_WORKER.start()
+    await VISION_BACKFILL.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await ALERT_WORKER.stop()
+    await VISION_BACKFILL.stop()
+
+
+@app.get("/vision/status")
+async def vision_status():
+    return {
+        "ok": True,
+        "config": {
+            "db_path": VISION_CONFIG.db_path,
+            "recent_days": VISION_CONFIG.recent_days,
+            "oldest_backfill_month": VISION_CONFIG.oldest_backfill_month,
+            "worker_interval_seconds": VISION_CONFIG.worker_interval_seconds,
+            "bootstrap_days_on_demand": VISION_CONFIG.bootstrap_days_on_demand,
+        },
+        "status": VISION_CACHE.status(),
+        "supported_symbols": sorted(SUPPORTED_SYMBOLS),
+        "supported_intervals": sorted(SUPPORTED_INTERVALS.keys(), key=lambda x: SUPPORTED_INTERVALS[x]),
+    }
+
+
+@app.post("/vision/bootstrap")
+async def vision_bootstrap(symbol: Optional[str] = None, days: Optional[int] = None):
+    symbols = [symbol.upper()] if symbol else sorted(SUPPORTED_SYMBOLS)
+    added: Dict[str, int] = {}
+    for s in symbols:
+        if s not in SUPPORTED_SYMBOLS:
+            continue
+        count = await VISION_BACKFILL.ensure_recent(s, days=days)
+        if count == 0:
+            # Fallback short seed from Binance 1s klines for immediate chart usability.
+            count = VISION_CACHE.seed_recent_from_binance_klines(s, seconds=3600)
+        added[s] = count
+    return {"ok": True, "added": added, "status": VISION_CACHE.status()}
+
+
+@app.get("/candles")
+async def get_candles(
+    symbol: str = Query(..., description="Symbol, e.g. BTCUSDT"),
+    interval: str = Query("1s", description="Interval, e.g. 1s, 5s, 1m"),
+    from_ts: Optional[int] = Query(None, alias="from", description="From unix seconds"),
+    to_ts: Optional[int] = Query(None, alias="to", description="To unix seconds"),
+    limit: Optional[int] = Query(2000, description="Maximum number of bars to return"),
+):
+    sym = symbol.upper().strip()
+    tf = interval.strip()
+    if sym not in SUPPORTED_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Unsupported symbol: {sym}")
+    if tf not in SUPPORTED_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Unsupported interval: {tf}")
+
+    now_sec = int(datetime.utcnow().timestamp())
+    to_s = to_ts if to_ts is not None else now_sec
+    from_s = from_ts if from_ts is not None else max(0, to_s - SUPPORTED_INTERVALS[tf] * max(1000, (limit or 2000)))
+    if from_s > to_s:
+        from_s, to_s = to_s, from_s
+
+    rows = VISION_CACHE.get_candles(
+        symbol=sym,
+        interval=tf,
+        from_ts=from_s,
+        to_ts=to_s,
+        limit=max(1, min(10000, limit or 2000)),
+    )
+    if not rows:
+        # On-demand bootstrap for first request on fresh deployment.
+        await VISION_BACKFILL.ensure_recent(sym, days=VISION_CONFIG.bootstrap_days_on_demand)
+        rows = VISION_CACHE.get_candles(
+            symbol=sym,
+            interval=tf,
+            from_ts=from_s,
+            to_ts=to_s,
+            limit=max(1, min(10000, limit or 2000)),
+        )
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "interval": tf,
+        "from": from_s,
+        "to": to_s,
+        "count": len(rows),
+        "candles": rows,
+    }
 
 
 @app.get("/scripts", response_model=List[ScriptInfo])
