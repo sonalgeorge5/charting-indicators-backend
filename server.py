@@ -64,11 +64,29 @@ SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Built-in indicators directory
 BUILTIN_DIR = Path(__file__).parent / "builtin"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 ALERT_CONFIG = AlertConfig.from_env()
 ALERT_WORKER = EmaRetestAlertWorker(ALERT_CONFIG)
 VISION_CONFIG = VisionConfig.from_env()
 VISION_CACHE = VisionCandleCache(VISION_CONFIG)
 VISION_BACKFILL = VisionBackfillService(VISION_CACHE, VISION_CONFIG)
+
+# Free-tier safe default: keep memory-heavy background loops disabled unless
+# explicitly enabled via environment variables.
+SAFE_MODE = _env_bool("SAFE_MODE", True)
+START_ALERT_WORKER = _env_bool("ALERT_STARTUP_ENABLED", False if SAFE_MODE else ALERT_CONFIG.enabled)
+START_VISION_BACKFILL = _env_bool(
+    "VISION_STARTUP_WORKER_ENABLED",
+    False if SAFE_MODE else VISION_CONFIG.worker_enabled,
+) and VISION_CONFIG.worker_enabled
 
 
 class OHLCVData(BaseModel):
@@ -252,20 +270,27 @@ async def root():
         "service": "CryptoChart Pro Indicator Server",
         "alerts": ALERT_WORKER.status(),
         "vision": VISION_CACHE.status(),
+        "runtime": {
+            "safe_mode": SAFE_MODE,
+            "start_alert_worker": START_ALERT_WORKER,
+            "start_vision_backfill": START_VISION_BACKFILL,
+        },
     }
 
 
 @app.on_event("startup")
 async def startup_event():
-    await ALERT_WORKER.start()
-    if VISION_CONFIG.worker_enabled:
+    if START_ALERT_WORKER:
+        await ALERT_WORKER.start()
+    if START_VISION_BACKFILL:
         await VISION_BACKFILL.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await ALERT_WORKER.stop()
-    if VISION_CONFIG.worker_enabled:
+    if START_ALERT_WORKER:
+        await ALERT_WORKER.stop()
+    if START_VISION_BACKFILL:
         await VISION_BACKFILL.stop()
 
 
@@ -284,6 +309,9 @@ async def vision_status():
             "normalize_on_start": VISION_CONFIG.normalize_on_start,
             "max_zip_download_bytes": VISION_CONFIG.max_zip_download_bytes,
             "klines_seed_seconds": VISION_CONFIG.klines_seed_seconds,
+            "safe_mode": SAFE_MODE,
+            "start_alert_worker": START_ALERT_WORKER,
+            "start_vision_backfill": START_VISION_BACKFILL,
         },
         "status": VISION_CACHE.status(),
         "supported_symbols": sorted(SUPPORTED_SYMBOLS),
