@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import io
+import json
 import os
 import sqlite3
 import threading
@@ -33,7 +34,11 @@ VISION_SPOT_DAILY_TRADES = (
 VISION_SPOT_MONTHLY_TRADES = (
     "https://data.binance.vision/data/spot/monthly/trades/{symbol}/{symbol}-trades-{month}.zip"
 )
-BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines"
+BINANCE_SPOT_KLINES_ENDPOINTS = (
+    "https://api.binance.com/api/v3/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+)
 
 
 @dataclass
@@ -619,26 +624,47 @@ class VisionCandleCache:
         end_ms = to_ts * 1000
         total = 0
         batch_rows: List[Tuple[int, float, float, float, float, float, int]] = []
+        last_err: Optional[str] = None
 
         while cursor_ms <= end_ms and total < max_points:
             batch_limit = min(1000, max_points - total)
             req_end_ms = min(end_ms, cursor_ms + (batch_limit - 1) * 1000)
-            url = (
-                f"{BINANCE_SPOT_KLINES}?symbol={symbol}&interval=1s"
+            query = (
+                f"symbol={symbol}&interval=1s"
                 f"&startTime={cursor_ms}&endTime={req_end_ms}&limit={batch_limit}"
             )
-            try:
-                with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
-                    data = resp.read().decode("utf-8")
-            except Exception:
-                break
-            try:
-                import json
+            data: Optional[str] = None
+            for base in BINANCE_SPOT_KLINES_ENDPOINTS:
+                url = f"{base}?{query}"
+                try:
+                    with urlopen(url, timeout=self.cfg.request_timeout_seconds) as resp:
+                        data = resp.read().decode("utf-8")
+                    break
+                except HTTPError as exc:
+                    last_err = f"{base}:http_{exc.code}"
+                except URLError as exc:
+                    last_err = f"{base}:url_{type(exc.reason).__name__}"
+                except Exception as exc:
+                    last_err = f"{base}:{type(exc).__name__}"
 
+            if data is None:
+                break
+
+            try:
                 rows = json.loads(data)
             except Exception:
+                last_err = "klines:invalid_json"
                 break
-            if not isinstance(rows, list) or not rows:
+            if isinstance(rows, dict):
+                code = rows.get("code")
+                last_err = f"klines:api_error_{code}" if code is not None else "klines:api_error"
+                break
+            if not isinstance(rows, list):
+                last_err = "klines:unexpected_payload"
+                break
+            if not rows:
+                if total == 0 and last_err is None:
+                    last_err = "klines:empty_window"
                 break
 
             last_open_ms = None
@@ -671,6 +697,8 @@ class VisionCandleCache:
         if batch_rows:
             self._insert_batch(symbol, batch_rows)
             self._set_progress_message(symbol, f"seeded from klines +{len(batch_rows)}")
+        else:
+            self._set_progress_message(symbol, f"klines seed returned 0 ({last_err or 'no_data'})")
         return len(batch_rows)
 
     def seed_recent_from_binance_klines(self, symbol: str, seconds: int = 3600) -> int:
