@@ -88,6 +88,7 @@ class VisionCandleCache:
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.cfg.db_path) or ".", exist_ok=True)
         self._init_db()
+        self._normalize_existing_candle_times()
 
     @contextmanager
     def _conn(self):
@@ -148,6 +149,86 @@ class VisionCandleCache:
                     """,
                     (symbol, start_backfill_month),
                 )
+
+    def _normalize_existing_candle_times(self) -> None:
+        """Repair older datasets that were stored with millisecond timestamps.
+
+        The table is expected to hold 1-second candles. If older buggy ingests wrote
+        millisecond-level rows, convert and aggregate them into 1-second bars.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM candles_1s WHERE time > 100000000000"
+            ).fetchone()
+            needs_fix = int(row["c"]) > 0 if row else False
+            if not needs_fix:
+                return
+
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS candles_1s_new;
+                CREATE TABLE candles_1s_new (
+                    symbol TEXT NOT NULL,
+                    time INTEGER NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    trades INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (symbol, time)
+                );
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO candles_1s_new (symbol, time, open, high, low, close, volume, trades)
+                WITH normalized AS (
+                    SELECT
+                        symbol,
+                        CASE
+                            WHEN time > 100000000000 THEN CAST(time / 1000 AS INTEGER)
+                            ELSE time
+                        END AS sec_time,
+                        time AS raw_time,
+                        open, high, low, close, volume, trades
+                    FROM candles_1s
+                ),
+                ranked AS (
+                    SELECT
+                        symbol, sec_time, raw_time, open, high, low, close, volume, trades,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol, sec_time
+                            ORDER BY raw_time ASC
+                        ) AS rn_open,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY symbol, sec_time
+                            ORDER BY raw_time DESC
+                        ) AS rn_close
+                    FROM normalized
+                )
+                SELECT
+                    symbol,
+                    sec_time AS time,
+                    MAX(CASE WHEN rn_open = 1 THEN open END) AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    MAX(CASE WHEN rn_close = 1 THEN close END) AS close,
+                    SUM(volume) AS volume,
+                    SUM(trades) AS trades
+                FROM ranked
+                GROUP BY symbol, sec_time
+                """
+            )
+
+            conn.executescript(
+                """
+                DROP TABLE candles_1s;
+                ALTER TABLE candles_1s_new RENAME TO candles_1s;
+                CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles_1s(symbol, time);
+                """
+            )
 
     def _is_ingested(self, file_key: str) -> bool:
         with self._conn() as conn:
@@ -570,4 +651,3 @@ class VisionBackfillService:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.worker_interval_seconds)
             except asyncio.TimeoutError:
                 continue
-
