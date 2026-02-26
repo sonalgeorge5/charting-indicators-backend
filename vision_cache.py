@@ -470,6 +470,7 @@ class VisionCandleCache:
             )
         return {
             "db_path": self.cfg.db_path,
+            "db_backend": "postgres" if self._use_postgres else "sqlite",
             "symbols": out,
         }
 
