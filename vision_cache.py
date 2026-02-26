@@ -14,6 +14,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:
+    psycopg = None
+    dict_row = None
+
 
 SUPPORTED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
 SUPPORTED_INTERVALS: Dict[str, int] = {
@@ -112,13 +119,38 @@ class VisionCandleCache:
     def __init__(self, cfg: VisionConfig) -> None:
         self.cfg = cfg
         self._lock = threading.Lock()
-        os.makedirs(os.path.dirname(self.cfg.db_path) or ".", exist_ok=True)
+        raw_database_url = os.getenv("DATABASE_URL", "").strip()
+        if raw_database_url.startswith("postgres://"):
+            raw_database_url = "postgresql://" + raw_database_url[len("postgres://"):]
+        self._database_url = raw_database_url
+        self._use_postgres = self._database_url.startswith("postgresql://")
+        if self._use_postgres:
+            if psycopg is None:
+                raise RuntimeError("DATABASE_URL is set but psycopg is not installed")
+        else:
+            os.makedirs(os.path.dirname(self.cfg.db_path) or ".", exist_ok=True)
         self._init_db()
-        if self.cfg.normalize_on_start:
+        if self.cfg.normalize_on_start and not self._use_postgres:
             self._normalize_existing_candle_times()
 
     @contextmanager
     def _conn(self):
+        if self._use_postgres:
+            conn = psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+                connect_timeout=self.cfg.request_timeout_seconds,
+            )
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return
+
         conn = sqlite3.connect(self.cfg.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
@@ -129,53 +161,105 @@ class VisionCandleCache:
 
     def _init_db(self) -> None:
         with self._conn() as conn:
-            conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS candles_1s (
-                    symbol TEXT NOT NULL,
-                    time INTEGER NOT NULL,
-                    open REAL NOT NULL,
-                    high REAL NOT NULL,
-                    low REAL NOT NULL,
-                    close REAL NOT NULL,
-                    volume REAL NOT NULL,
-                    trades INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (symbol, time)
-                );
+            if self._use_postgres:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS candles_1s (
+                        symbol TEXT NOT NULL,
+                        time BIGINT NOT NULL,
+                        open DOUBLE PRECISION NOT NULL,
+                        high DOUBLE PRECISION NOT NULL,
+                        low DOUBLE PRECISION NOT NULL,
+                        close DOUBLE PRECISION NOT NULL,
+                        volume DOUBLE PRECISION NOT NULL,
+                        trades INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (symbol, time)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ingested_files (
+                        file_key TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        processed_at BIGINT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS symbol_progress (
+                        symbol TEXT PRIMARY KEY,
+                        recent_bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                        backfill_cursor_month TEXT NOT NULL,
+                        last_recent_sync_at BIGINT,
+                        last_backfill_sync_at BIGINT,
+                        last_message TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles_1s(symbol, time)"
+                )
+            else:
+                conn.executescript(
+                    """
+                    PRAGMA journal_mode=WAL;
+                    CREATE TABLE IF NOT EXISTS candles_1s (
+                        symbol TEXT NOT NULL,
+                        time INTEGER NOT NULL,
+                        open REAL NOT NULL,
+                        high REAL NOT NULL,
+                        low REAL NOT NULL,
+                        close REAL NOT NULL,
+                        volume REAL NOT NULL,
+                        trades INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (symbol, time)
+                    );
 
-                CREATE TABLE IF NOT EXISTS ingested_files (
-                    file_key TEXT PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    processed_at INTEGER NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS ingested_files (
+                        file_key TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        processed_at INTEGER NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS symbol_progress (
-                    symbol TEXT PRIMARY KEY,
-                    recent_bootstrap_done INTEGER NOT NULL DEFAULT 0,
-                    backfill_cursor_month TEXT NOT NULL,
-                    last_recent_sync_at INTEGER,
-                    last_backfill_sync_at INTEGER,
-                    last_message TEXT
-                );
+                    CREATE TABLE IF NOT EXISTS symbol_progress (
+                        symbol TEXT PRIMARY KEY,
+                        recent_bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                        backfill_cursor_month TEXT NOT NULL,
+                        last_recent_sync_at INTEGER,
+                        last_backfill_sync_at INTEGER,
+                        last_message TEXT
+                    );
 
-                CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles_1s(symbol, time);
-                """
-            )
+                    CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles_1s(symbol, time);
+                    """
+                )
 
             today = datetime.now(timezone.utc).date()
             recent_start = today - timedelta(days=max(1, self.cfg.recent_days) - 1)
             start_backfill_month = _prev_month(_month_string(recent_start))
             for symbol in SUPPORTED_SYMBOLS:
-                conn.execute(
-                    """
-                    INSERT INTO symbol_progress (symbol, backfill_cursor_month)
-                    VALUES (?, ?)
-                    ON CONFLICT(symbol) DO NOTHING
-                    """,
-                    (symbol, start_backfill_month),
-                )
+                if self._use_postgres:
+                    conn.execute(
+                        """
+                        INSERT INTO symbol_progress (symbol, backfill_cursor_month)
+                        VALUES (%s, %s)
+                        ON CONFLICT(symbol) DO NOTHING
+                        """,
+                        (symbol, start_backfill_month),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO symbol_progress (symbol, backfill_cursor_month)
+                        VALUES (?, ?)
+                        ON CONFLICT(symbol) DO NOTHING
+                        """,
+                        (symbol, start_backfill_month),
+                    )
 
     def _normalize_existing_candle_times(self) -> None:
         """Repair older datasets that were stored with millisecond timestamps.
@@ -259,50 +343,95 @@ class VisionCandleCache:
 
     def _is_ingested(self, file_key: str) -> bool:
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM ingested_files WHERE file_key = ?",
-                (file_key,),
-            ).fetchone()
+            if self._use_postgres:
+                row = conn.execute(
+                    "SELECT 1 FROM ingested_files WHERE file_key = %s",
+                    (file_key,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM ingested_files WHERE file_key = ?",
+                    (file_key,),
+                ).fetchone()
             return row is not None
 
     def _mark_ingested(self, file_key: str, symbol: str, source: str) -> None:
         with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO ingested_files (file_key, symbol, source, processed_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (file_key, symbol, source, int(time.time())),
-            )
+            if self._use_postgres:
+                conn.execute(
+                    """
+                    INSERT INTO ingested_files (file_key, symbol, source, processed_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT(file_key) DO UPDATE SET
+                        symbol = EXCLUDED.symbol,
+                        source = EXCLUDED.source,
+                        processed_at = EXCLUDED.processed_at
+                    """,
+                    (file_key, symbol, source, int(time.time())),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ingested_files (file_key, symbol, source, processed_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (file_key, symbol, source, int(time.time())),
+                )
 
     def _set_progress_message(self, symbol: str, message: str) -> None:
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE symbol_progress SET last_message = ? WHERE symbol = ?",
-                (message, symbol),
-            )
+            if self._use_postgres:
+                conn.execute(
+                    "UPDATE symbol_progress SET last_message = %s WHERE symbol = %s",
+                    (message, symbol),
+                )
+            else:
+                conn.execute(
+                    "UPDATE symbol_progress SET last_message = ? WHERE symbol = ?",
+                    (message, symbol),
+                )
 
     def _set_recent_done(self, symbol: str) -> None:
         with self._conn() as conn:
-            conn.execute(
-                """
-                UPDATE symbol_progress
-                SET recent_bootstrap_done = 1, last_recent_sync_at = ?, last_message = ?
-                WHERE symbol = ?
-                """,
-                (int(time.time()), "recent bootstrap completed", symbol),
-            )
+            if self._use_postgres:
+                conn.execute(
+                    """
+                    UPDATE symbol_progress
+                    SET recent_bootstrap_done = 1, last_recent_sync_at = %s, last_message = %s
+                    WHERE symbol = %s
+                    """,
+                    (int(time.time()), "recent bootstrap completed", symbol),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE symbol_progress
+                    SET recent_bootstrap_done = 1, last_recent_sync_at = ?, last_message = ?
+                    WHERE symbol = ?
+                    """,
+                    (int(time.time()), "recent bootstrap completed", symbol),
+                )
 
     def _advance_backfill_month(self, symbol: str, next_month: str, message: str) -> None:
         with self._conn() as conn:
-            conn.execute(
-                """
-                UPDATE symbol_progress
-                SET backfill_cursor_month = ?, last_backfill_sync_at = ?, last_message = ?
-                WHERE symbol = ?
-                """,
-                (next_month, int(time.time()), message, symbol),
-            )
+            if self._use_postgres:
+                conn.execute(
+                    """
+                    UPDATE symbol_progress
+                    SET backfill_cursor_month = %s, last_backfill_sync_at = %s, last_message = %s
+                    WHERE symbol = %s
+                    """,
+                    (next_month, int(time.time()), message, symbol),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE symbol_progress
+                    SET backfill_cursor_month = ?, last_backfill_sync_at = ?, last_message = ?
+                    WHERE symbol = ?
+                    """,
+                    (next_month, int(time.time()), message, symbol),
+                )
 
     def status(self) -> Dict[str, Any]:
         with self._conn() as conn:
@@ -373,21 +502,40 @@ class VisionCandleCache:
             return None
 
     def _insert_batch(self, symbol: str, rows: Iterable[Tuple[int, float, float, float, float, float, int]]) -> None:
+        params = [(symbol, *r) for r in rows]
+        if not params:
+            return
         with self._conn() as conn:
-            conn.executemany(
-                """
-                INSERT INTO candles_1s (symbol, time, open, high, low, close, volume, trades)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, time) DO UPDATE SET
-                    open = excluded.open,
-                    high = excluded.high,
-                    low = excluded.low,
-                    close = excluded.close,
-                    volume = excluded.volume,
-                    trades = excluded.trades
-                """,
-                [(symbol, *r) for r in rows],
-            )
+            if self._use_postgres:
+                conn.executemany(
+                    """
+                    INSERT INTO candles_1s (symbol, time, open, high, low, close, volume, trades)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(symbol, time) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        trades = EXCLUDED.trades
+                    """,
+                    params,
+                )
+            else:
+                conn.executemany(
+                    """
+                    INSERT INTO candles_1s (symbol, time, open, high, low, close, volume, trades)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, time) DO UPDATE SET
+                        open = excluded.open,
+                        high = excluded.high,
+                        low = excluded.low,
+                        close = excluded.close,
+                        volume = excluded.volume,
+                        trades = excluded.trades
+                    """,
+                    params,
+                )
 
     def _ingest_trade_zip(self, symbol: str, zip_bytes: bytes, file_key: str, source: str) -> int:
         if self._is_ingested(file_key):
@@ -499,10 +647,16 @@ class VisionCandleCache:
         if symbol not in SUPPORTED_SYMBOLS:
             return 0
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT backfill_cursor_month FROM symbol_progress WHERE symbol = ?",
-                (symbol,),
-            ).fetchone()
+            if self._use_postgres:
+                row = conn.execute(
+                    "SELECT backfill_cursor_month FROM symbol_progress WHERE symbol = %s",
+                    (symbol,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT backfill_cursor_month FROM symbol_progress WHERE symbol = ?",
+                    (symbol,),
+                ).fetchone()
         if not row:
             return 0
         month = row["backfill_cursor_month"]
@@ -530,17 +684,30 @@ class VisionCandleCache:
         limit: Optional[int],
     ) -> List[Dict[str, Any]]:
         with self._conn() as conn:
-            sql = """
-                SELECT time, open, high, low, close, volume, trades
-                FROM candles_1s
-                WHERE symbol = ? AND time >= ? AND time <= ?
-                ORDER BY time ASC
-            """
-            params: List[Any] = [symbol, from_ts, to_ts]
-            if limit is not None and limit > 0:
-                sql += " LIMIT ?"
-                params.append(limit)
-            rows = conn.execute(sql, tuple(params)).fetchall()
+            if self._use_postgres:
+                sql = """
+                    SELECT time, open, high, low, close, volume, trades
+                    FROM candles_1s
+                    WHERE symbol = %s AND time >= %s AND time <= %s
+                    ORDER BY time ASC
+                """
+                params: List[Any] = [symbol, from_ts, to_ts]
+                if limit is not None and limit > 0:
+                    sql += " LIMIT %s"
+                    params.append(limit)
+                rows = conn.execute(sql, tuple(params)).fetchall()
+            else:
+                sql = """
+                    SELECT time, open, high, low, close, volume, trades
+                    FROM candles_1s
+                    WHERE symbol = ? AND time >= ? AND time <= ?
+                    ORDER BY time ASC
+                """
+                params = [symbol, from_ts, to_ts]
+                if limit is not None and limit > 0:
+                    sql += " LIMIT ?"
+                    params.append(limit)
+                rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in rows]
 
     def _query_aggregated(
@@ -552,42 +719,75 @@ class VisionCandleCache:
         limit: Optional[int],
     ) -> List[Dict[str, Any]]:
         with self._conn() as conn:
-            sql = """
-                WITH bucketed AS (
+            if self._use_postgres:
+                sql = """
+                    WITH bucketed AS (
+                        SELECT
+                            ((time / %s) * %s) AS bucket_time,
+                            time, open, high, low, close, volume
+                        FROM candles_1s
+                        WHERE symbol = %s AND time >= %s AND time <= %s
+                    ),
+                    ranked AS (
+                        SELECT
+                            bucket_time, time, open, high, low, close, volume,
+                            ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time ASC) AS rn_open,
+                            ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time DESC) AS rn_close
+                        FROM bucketed
+                    )
                     SELECT
-                        ((time / :bucket) * :bucket) AS bucket_time,
-                        time, open, high, low, close, volume
-                    FROM candles_1s
-                    WHERE symbol = :symbol AND time >= :from_ts AND time <= :to_ts
-                ),
-                ranked AS (
+                        bucket_time AS time,
+                        MAX(CASE WHEN rn_open = 1 THEN open END) AS open,
+                        MAX(high) AS high,
+                        MIN(low) AS low,
+                        MAX(CASE WHEN rn_close = 1 THEN close END) AS close,
+                        SUM(volume) AS volume
+                    FROM ranked
+                    GROUP BY bucket_time
+                    ORDER BY bucket_time ASC
+                """
+                params: List[Any] = [bucket_seconds, bucket_seconds, symbol, from_ts, to_ts]
+                if limit is not None and limit > 0:
+                    sql += " LIMIT %s"
+                    params.append(limit)
+                rows = conn.execute(sql, tuple(params)).fetchall()
+            else:
+                sql = """
+                    WITH bucketed AS (
+                        SELECT
+                            ((time / :bucket) * :bucket) AS bucket_time,
+                            time, open, high, low, close, volume
+                        FROM candles_1s
+                        WHERE symbol = :symbol AND time >= :from_ts AND time <= :to_ts
+                    ),
+                    ranked AS (
+                        SELECT
+                            bucket_time, time, open, high, low, close, volume,
+                            ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time ASC) AS rn_open,
+                            ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time DESC) AS rn_close
+                        FROM bucketed
+                    )
                     SELECT
-                        bucket_time, time, open, high, low, close, volume,
-                        ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time ASC) AS rn_open,
-                        ROW_NUMBER() OVER (PARTITION BY bucket_time ORDER BY time DESC) AS rn_close
-                    FROM bucketed
-                )
-                SELECT
-                    bucket_time AS time,
-                    MAX(CASE WHEN rn_open = 1 THEN open END) AS open,
-                    MAX(high) AS high,
-                    MIN(low) AS low,
-                    MAX(CASE WHEN rn_close = 1 THEN close END) AS close,
-                    SUM(volume) AS volume
-                FROM ranked
-                GROUP BY bucket_time
-                ORDER BY bucket_time ASC
-            """
-            if limit is not None and limit > 0:
-                sql += " LIMIT :limit"
-            params = {
-                "symbol": symbol,
-                "from_ts": from_ts,
-                "to_ts": to_ts,
-                "bucket": bucket_seconds,
-                "limit": limit if limit is not None else -1,
-            }
-            rows = conn.execute(sql, params).fetchall()
+                        bucket_time AS time,
+                        MAX(CASE WHEN rn_open = 1 THEN open END) AS open,
+                        MAX(high) AS high,
+                        MIN(low) AS low,
+                        MAX(CASE WHEN rn_close = 1 THEN close END) AS close,
+                        SUM(volume) AS volume
+                    FROM ranked
+                    GROUP BY bucket_time
+                    ORDER BY bucket_time ASC
+                """
+                if limit is not None and limit > 0:
+                    sql += " LIMIT :limit"
+                params = {
+                    "symbol": symbol,
+                    "from_ts": from_ts,
+                    "to_ts": to_ts,
+                    "bucket": bucket_seconds,
+                    "limit": limit if limit is not None else -1,
+                }
+                rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_candles(
