@@ -89,6 +89,81 @@ START_VISION_BACKFILL = _env_bool(
     False if SAFE_MODE else VISION_CONFIG.worker_enabled,
 ) and VISION_CONFIG.worker_enabled
 
+VISION_BOOTSTRAP_TASK: Optional[asyncio.Task] = None
+VISION_BOOTSTRAP_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+    "symbols": [],
+    "last_added": {},
+}
+
+
+def _bootstrap_status() -> Dict[str, Any]:
+    task_running = bool(VISION_BOOTSTRAP_TASK and not VISION_BOOTSTRAP_TASK.done())
+    return {
+        "running": task_running or bool(VISION_BOOTSTRAP_STATE.get("running")),
+        "task_running": task_running,
+        "started_at": VISION_BOOTSTRAP_STATE.get("started_at"),
+        "finished_at": VISION_BOOTSTRAP_STATE.get("finished_at"),
+        "last_error": VISION_BOOTSTRAP_STATE.get("last_error"),
+        "symbols": VISION_BOOTSTRAP_STATE.get("symbols", []),
+        "last_added": VISION_BOOTSTRAP_STATE.get("last_added", {}),
+    }
+
+
+async def _run_vision_bootstrap(symbols: List[str], days: Optional[int], full: bool) -> Dict[str, int]:
+    added: Dict[str, int] = {}
+    VISION_BOOTSTRAP_STATE["running"] = True
+    VISION_BOOTSTRAP_STATE["started_at"] = int(datetime.utcnow().timestamp())
+    VISION_BOOTSTRAP_STATE["finished_at"] = None
+    VISION_BOOTSTRAP_STATE["last_error"] = None
+    VISION_BOOTSTRAP_STATE["symbols"] = list(symbols)
+    VISION_BOOTSTRAP_STATE["last_added"] = {}
+
+    try:
+        for s in symbols:
+            try:
+                VISION_CACHE._set_progress_message(s, "bootstrap running")
+                if full and not VISION_CONFIG.low_memory_mode:
+                    count = await VISION_BACKFILL.ensure_recent(s, days=days)
+                else:
+                    now_s = int(datetime.utcnow().timestamp())
+                    requested_days = max(1, int(days)) if days is not None else None
+                    seed_seconds = VISION_CONFIG.klines_seed_seconds
+                    if requested_days is not None:
+                        seed_seconds = min(35 * 86400, requested_days * 86400)
+                    max_points = min(500000, max(12000, seed_seconds + 120))
+                    count = await asyncio.to_thread(
+                        VISION_CACHE.seed_range_from_binance_klines,
+                        s,
+                        max(0, now_s - seed_seconds),
+                        now_s,
+                        max_points,
+                    )
+                    # Vision daily trade zips fill sparse regions that can happen with
+                    # API-backed 1s pulls in some network/region conditions.
+                    days_to_ingest = min(35, requested_days if requested_days is not None else max(1, (seed_seconds // 86400) + 1))
+                    zip_added = await asyncio.to_thread(VISION_CACHE.ingest_recent_days, s, days_to_ingest)
+                    count += zip_added
+                if count == 0:
+                    # Fallback short seed from Binance 1s klines for immediate chart usability.
+                    count = await asyncio.to_thread(VISION_CACHE.seed_recent_from_binance_klines, s, 3600, 20000)
+                added[s] = count
+                VISION_BOOTSTRAP_STATE["last_added"][s] = count
+            except Exception as exc:
+                VISION_BOOTSTRAP_STATE["last_error"] = f"{s}: {type(exc).__name__}"
+                VISION_CACHE._set_progress_message(s, f"bootstrap error: {type(exc).__name__}")
+                added[s] = added.get(s, 0)
+    except Exception as exc:
+        VISION_BOOTSTRAP_STATE["last_error"] = f"bootstrap: {type(exc).__name__}"
+    finally:
+        VISION_BOOTSTRAP_STATE["running"] = False
+        VISION_BOOTSTRAP_STATE["finished_at"] = int(datetime.utcnow().timestamp())
+
+    return added
+
 
 class OHLCVData(BaseModel):
     time: List[int]
@@ -315,6 +390,7 @@ async def vision_status():
             "start_vision_backfill": START_VISION_BACKFILL,
         },
         "status": VISION_CACHE.status(),
+        "bootstrap": _bootstrap_status(),
         "supported_symbols": sorted(SUPPORTED_SYMBOLS),
         "supported_intervals": sorted(SUPPORTED_INTERVALS.keys(), key=lambda x: SUPPORTED_INTERVALS[x]),
     }
@@ -325,38 +401,49 @@ async def vision_bootstrap(
     symbol: Optional[str] = None,
     days: Optional[int] = None,
     full: bool = False,
+    background: bool = True,
 ):
-    symbols = [symbol.upper()] if symbol else sorted(SUPPORTED_SYMBOLS)
-    added: Dict[str, int] = {}
-    for s in symbols:
-        if s not in SUPPORTED_SYMBOLS:
-            continue
-        if full and not VISION_CONFIG.low_memory_mode:
-            count = await VISION_BACKFILL.ensure_recent(s, days=days)
-        else:
-            now_s = int(datetime.utcnow().timestamp())
-            requested_days = max(1, int(days)) if days is not None else None
-            seed_seconds = VISION_CONFIG.klines_seed_seconds
-            if requested_days is not None:
-                seed_seconds = min(35 * 86400, requested_days * 86400)
-            max_points = min(500000, max(12000, seed_seconds + 120))
-            count = await asyncio.to_thread(
-                VISION_CACHE.seed_range_from_binance_klines,
-                s,
-                max(0, now_s - seed_seconds),
-                now_s,
-                max_points,
-            )
-            # Vision daily trade zips fill sparse regions that can happen with
-            # API-backed 1s pulls in some network/region conditions.
-            days_to_ingest = min(35, requested_days if requested_days is not None else max(1, (seed_seconds // 86400) + 1))
-            zip_added = await asyncio.to_thread(VISION_CACHE.ingest_recent_days, s, days_to_ingest)
-            count += zip_added
-        if count == 0:
-            # Fallback short seed from Binance 1s klines for immediate chart usability.
-            count = await asyncio.to_thread(VISION_CACHE.seed_recent_from_binance_klines, s, 3600, 20000)
-        added[s] = count
-    return {"ok": True, "added": added, "status": VISION_CACHE.status()}
+    global VISION_BOOTSTRAP_TASK
+
+    requested_symbols = [symbol.upper()] if symbol else sorted(SUPPORTED_SYMBOLS)
+    symbols = [s for s in requested_symbols if s in SUPPORTED_SYMBOLS]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No supported symbols requested for bootstrap")
+
+    if background:
+        if VISION_BOOTSTRAP_TASK and not VISION_BOOTSTRAP_TASK.done():
+            return {
+                "ok": True,
+                "queued": False,
+                "running": True,
+                "requested_symbols": requested_symbols,
+                "symbols": symbols,
+                "bootstrap": _bootstrap_status(),
+                "status": VISION_CACHE.status(),
+            }
+
+        VISION_BOOTSTRAP_TASK = asyncio.create_task(_run_vision_bootstrap(symbols, days, full))
+        return {
+            "ok": True,
+            "queued": True,
+            "running": True,
+            "requested_symbols": requested_symbols,
+            "symbols": symbols,
+            "bootstrap": _bootstrap_status(),
+            "status": VISION_CACHE.status(),
+        }
+
+    added = await _run_vision_bootstrap(symbols, days, full)
+    return {
+        "ok": True,
+        "queued": False,
+        "running": _bootstrap_status().get("running", False),
+        "requested_symbols": requested_symbols,
+        "symbols": symbols,
+        "added": added,
+        "bootstrap": _bootstrap_status(),
+        "status": VISION_CACHE.status(),
+    }
 
 
 @app.get("/candles")
