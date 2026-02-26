@@ -619,7 +619,7 @@ class VisionCandleCache:
             return 0
         if to_ts < from_ts:
             return 0
-        max_points = max(1, min(20000, max_points))
+        max_points = max(1, min(500000, max_points))
         cursor_ms = from_ts * 1000
         end_ms = to_ts * 1000
         total = 0
@@ -684,6 +684,9 @@ class VisionCandleCache:
                     )
                     total += 1
                     last_open_ms = int(k[0])
+                    if len(batch_rows) >= 5000:
+                        self._insert_batch(symbol, batch_rows)
+                        batch_rows.clear()
                 except Exception:
                     continue
 
@@ -696,17 +699,20 @@ class VisionCandleCache:
 
         if batch_rows:
             self._insert_batch(symbol, batch_rows)
-            self._set_progress_message(symbol, f"seeded from klines +{len(batch_rows)}")
+            batch_rows.clear()
+        if total > 0:
+            self._set_progress_message(symbol, f"seeded from klines +{total}")
         else:
             self._set_progress_message(symbol, f"klines seed returned 0 ({last_err or 'no_data'})")
-        return len(batch_rows)
+        return total
 
-    def seed_recent_from_binance_klines(self, symbol: str, seconds: int = 3600) -> int:
+    def seed_recent_from_binance_klines(self, symbol: str, seconds: int = 3600, max_points: Optional[int] = None) -> int:
         if symbol not in SUPPORTED_SYMBOLS:
             return 0
         now_sec = int(time.time())
         start_sec = max(0, now_sec - max(1, seconds))
-        return self.seed_range_from_binance_klines(symbol, start_sec, now_sec, max_points=12000)
+        points = max_points if max_points is not None else min(500000, max(12000, seconds + 120))
+        return self.seed_range_from_binance_klines(symbol, start_sec, now_sec, max_points=points)
 
 
 class VisionBackfillService:

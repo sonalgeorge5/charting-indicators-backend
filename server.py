@@ -3,6 +3,7 @@ CryptoChart Pro - Python Indicator Server
 FastAPI server for executing custom Python indicators
 """
 
+import asyncio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -335,15 +336,16 @@ async def vision_bootstrap(
         else:
             now_s = int(datetime.utcnow().timestamp())
             seed_seconds = VISION_CONFIG.klines_seed_seconds
+            max_points = min(500000, max(12000, seed_seconds + 120))
             count = VISION_CACHE.seed_range_from_binance_klines(
                 s,
                 max(0, now_s - seed_seconds),
                 now_s,
-                max_points=12000,
+                max_points=max_points,
             )
         if count == 0:
             # Fallback short seed from Binance 1s klines for immediate chart usability.
-            count = VISION_CACHE.seed_recent_from_binance_klines(s, seconds=3600)
+            count = VISION_CACHE.seed_recent_from_binance_klines(s, seconds=3600, max_points=20000)
         added[s] = count
     return {"ok": True, "added": added, "status": VISION_CACHE.status()}
 
@@ -379,7 +381,16 @@ async def get_candles(
     if not rows:
         # On-demand bootstrap for first request on fresh deployment.
         if VISION_CONFIG.low_memory_mode:
-            VISION_CACHE.seed_range_from_binance_klines(sym, from_s, to_s, max_points=12000)
+            window_seconds = max(1, to_s - from_s + 1)
+            window_points = min(500000, max(12000, window_seconds + 120))
+            VISION_CACHE.seed_range_from_binance_klines(sym, from_s, to_s, max_points=window_points)
+
+            # If klines are empty/unavailable for part of the requested range,
+            # ingest recent daily trade zips from Binance Vision to widen coverage.
+            if not VISION_CACHE.get_candles(sym, tf, from_s, to_s, limit=max(1, min(10000, limit or 2000))):
+                days_back = max(1, ((now_sec - max(0, from_s)) // 86400) + 1)
+                days_to_ingest = min(35, days_back)
+                await asyncio.to_thread(VISION_CACHE.ingest_recent_days, sym, days_to_ingest)
         else:
             await VISION_BACKFILL.ensure_recent(sym, days=VISION_CONFIG.bootstrap_days_on_demand)
         rows = VISION_CACHE.get_candles(
