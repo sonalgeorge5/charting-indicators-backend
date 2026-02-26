@@ -335,7 +335,10 @@ async def vision_bootstrap(
             count = await VISION_BACKFILL.ensure_recent(s, days=days)
         else:
             now_s = int(datetime.utcnow().timestamp())
+            requested_days = max(1, int(days)) if days is not None else None
             seed_seconds = VISION_CONFIG.klines_seed_seconds
+            if requested_days is not None:
+                seed_seconds = min(35 * 86400, requested_days * 86400)
             max_points = min(500000, max(12000, seed_seconds + 120))
             count = VISION_CACHE.seed_range_from_binance_klines(
                 s,
@@ -343,6 +346,11 @@ async def vision_bootstrap(
                 now_s,
                 max_points=max_points,
             )
+            # Vision daily trade zips fill sparse regions that can happen with
+            # API-backed 1s pulls in some network/region conditions.
+            days_to_ingest = min(35, requested_days if requested_days is not None else max(1, (seed_seconds // 86400) + 1))
+            zip_added = await asyncio.to_thread(VISION_CACHE.ingest_recent_days, s, days_to_ingest)
+            count += zip_added
         if count == 0:
             # Fallback short seed from Binance 1s klines for immediate chart usability.
             count = VISION_CACHE.seed_recent_from_binance_klines(s, seconds=3600, max_points=20000)
@@ -370,13 +378,14 @@ async def get_candles(
     from_s = from_ts if from_ts is not None else max(0, to_s - SUPPORTED_INTERVALS[tf] * max(1000, (limit or 2000)))
     if from_s > to_s:
         from_s, to_s = to_s, from_s
+    query_limit = max(1, min(10000, limit or 2000))
 
     rows = VISION_CACHE.get_candles(
         symbol=sym,
         interval=tf,
         from_ts=from_s,
         to_ts=to_s,
-        limit=max(1, min(10000, limit or 2000)),
+        limit=query_limit,
     )
     if not rows:
         # On-demand bootstrap for first request on fresh deployment.
@@ -387,7 +396,7 @@ async def get_candles(
 
             # If klines are empty/unavailable for part of the requested range,
             # ingest recent daily trade zips from Binance Vision to widen coverage.
-            if not VISION_CACHE.get_candles(sym, tf, from_s, to_s, limit=max(1, min(10000, limit or 2000))):
+            if not VISION_CACHE.get_candles(sym, tf, from_s, to_s, limit=query_limit):
                 days_back = max(1, ((now_sec - max(0, from_s)) // 86400) + 1)
                 days_to_ingest = min(35, days_back)
                 await asyncio.to_thread(VISION_CACHE.ingest_recent_days, sym, days_to_ingest)
@@ -398,8 +407,27 @@ async def get_candles(
             interval=tf,
             from_ts=from_s,
             to_ts=to_s,
-            limit=max(1, min(10000, limit or 2000)),
+            limit=query_limit,
         )
+    elif VISION_CONFIG.low_memory_mode and from_s >= max(0, now_sec - 35 * 86400):
+        # Heal sparse ranges (not only fully empty ranges).
+        expected_full = max(1, ((to_s - from_s) // SUPPORTED_INTERVALS[tf]) + 1)
+        expected_window = min(expected_full, query_limit)
+        coverage = len(rows) / expected_window if expected_window > 0 else 1.0
+        if expected_window >= 300 and coverage < 0.7:
+            window_seconds = max(1, to_s - from_s + 1)
+            window_points = min(500000, max(12000, window_seconds + 120))
+            VISION_CACHE.seed_range_from_binance_klines(sym, from_s, to_s, max_points=window_points)
+            days_back = max(1, ((now_sec - max(0, from_s)) // 86400) + 1)
+            days_to_ingest = min(35, days_back)
+            await asyncio.to_thread(VISION_CACHE.ingest_recent_days, sym, days_to_ingest)
+            rows = VISION_CACHE.get_candles(
+                symbol=sym,
+                interval=tf,
+                from_ts=from_s,
+                to_ts=to_s,
+                limit=query_limit,
+            )
 
     return {
         "ok": True,
