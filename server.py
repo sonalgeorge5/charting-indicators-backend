@@ -88,6 +88,7 @@ START_VISION_BACKFILL = _env_bool(
     "VISION_STARTUP_WORKER_ENABLED",
     False if SAFE_MODE else VISION_CONFIG.worker_enabled,
 ) and VISION_CONFIG.worker_enabled
+VISION_ENABLE_ZIP_INGEST = _env_bool("VISION_ENABLE_ZIP_INGEST", False if SAFE_MODE else True)
 
 VISION_BOOTSTRAP_TASK: Optional[asyncio.Task] = None
 VISION_BOOTSTRAP_STATE: Dict[str, Any] = {
@@ -142,11 +143,14 @@ async def _run_vision_bootstrap(symbols: List[str], days: Optional[int], full: b
                         now_s,
                         max_points,
                     )
-                    # Vision daily trade zips fill sparse regions that can happen with
-                    # API-backed 1s pulls in some network/region conditions.
-                    days_to_ingest = min(35, requested_days if requested_days is not None else max(1, (seed_seconds // 86400) + 1))
-                    zip_added = await asyncio.to_thread(VISION_CACHE.ingest_recent_days, s, days_to_ingest)
-                    count += zip_added
+                    # In free-tier safe mode default to fast klines-only bootstrap.
+                    if VISION_ENABLE_ZIP_INGEST:
+                        days_to_ingest = min(
+                            35,
+                            requested_days if requested_days is not None else max(1, (seed_seconds // 86400) + 1),
+                        )
+                        zip_added = await asyncio.to_thread(VISION_CACHE.ingest_recent_days, s, days_to_ingest)
+                        count += zip_added
                 if count == 0:
                     # Fallback short seed from Binance 1s klines for immediate chart usability.
                     count = await asyncio.to_thread(VISION_CACHE.seed_recent_from_binance_klines, s, 3600, 20000)
@@ -385,6 +389,7 @@ async def vision_status():
             "normalize_on_start": VISION_CONFIG.normalize_on_start,
             "max_zip_download_bytes": VISION_CONFIG.max_zip_download_bytes,
             "klines_seed_seconds": VISION_CONFIG.klines_seed_seconds,
+            "zip_ingest_enabled": VISION_ENABLE_ZIP_INGEST,
             "safe_mode": SAFE_MODE,
             "start_alert_worker": START_ALERT_WORKER,
             "start_vision_backfill": START_VISION_BACKFILL,
